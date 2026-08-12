@@ -12,8 +12,8 @@
  * device, with the account panel showing that cloud saves are switched off.
  */
 
-export const SUPABASE_URL = '';
-export const SUPABASE_ANON_KEY = '';
+export const SUPABASE_URL = 'https://qsyxckyodnzoyrqayusd.supabase.co/rest/v1/';
+export const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFzeXhja3lvZG56b3lycWF5dXNkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODY1NzE4NTEsImV4cCI6MjEwMjE0Nzg1MX0.H0tYZmJ7QflZWvKuXHE6YLRzcuiDRIWTWcOCJL3wJlA';
 
 /** Lets you try a project without editing this file — Setup → Account. */
 const OVERRIDE_KEY = 'fretpro.supabase';
