@@ -91,12 +91,28 @@ export function save() {
 
 export function saveNow() {
   clearTimeout(saveTimer);
+  state.updatedAt = Date.now();
+  for (const fn of changeListeners) {
+    try {
+      fn(state);
+    } catch (err) {
+      console.warn('A change listener failed.', err);
+    }
+  }
   if (!storage) return;
   try {
     storage.setItem(KEY, JSON.stringify(state));
   } catch (err) {
     console.warn('Could not save progress.', err);
   }
+}
+
+const changeListeners = new Set();
+
+/** Called after every save — how the cloud sync knows there is work to push. */
+export function onChange(fn) {
+  changeListeners.add(fn);
+  return () => changeListeners.delete(fn);
 }
 
 export const getState = () => state;
@@ -202,6 +218,142 @@ export function importJson(text) {
   if (!parsed || typeof parsed !== 'object' || !parsed.settings) throw new Error('That file is not a FretPro backup.');
   if (storage) storage.setItem(KEY, JSON.stringify(parsed));
   state = load();
+}
+
+/* ---------- cloud sync ------------------------------------------------ */
+
+/**
+ * What gets uploaded. Calibration and deviceId stay on this device on purpose:
+ * a noise gate measured on one laptop's microphone is wrong for another.
+ */
+export function syncPayload(source = state) {
+  const { deviceId, ...settings } = source.settings;
+  return {
+    version: source.version,
+    updatedAt: source.updatedAt || 0,
+    settings,
+    progress: source.progress,
+    notes: source.notes,
+    stats: source.stats,
+  };
+}
+
+const maxNum = (a, b) => Math.max(Number(a) || 0, Number(b) || 0);
+
+/**
+ * Combine two saved states without losing progress from either side.
+ *
+ * Practice history is additive, so nearly everything resolves by taking the
+ * better value rather than the newer one — two devices used offline on the
+ * same day should end up with the sum of the work, not whichever synced last.
+ * Only genuinely single-valued things (settings) fall back to "newer wins".
+ *
+ * @param {object} local the state on this device
+ * @param {object} remote the state fetched from Supabase
+ * @returns {object} a new merged state; neither input is modified
+ */
+export function mergeStates(local, remote) {
+  if (!remote) return local;
+  if (!local) return remote;
+
+  const localNewer = (local.updatedAt || 0) >= (remote.updatedAt || 0);
+  const base = blank();
+
+  // Settings are single-valued preferences, so the newer side wins outright.
+  const preferred = localNewer ? local : remote;
+  const settings = { ...base.settings, ...(preferred.settings || {}) };
+  // deviceId always belongs to this device.
+  settings.deviceId = (local.settings && local.settings.deviceId) || settings.deviceId;
+
+  // Lesson levels only ever go up.
+  const progress = {};
+  for (const id of new Set([...Object.keys(local.progress || {}), ...Object.keys(remote.progress || {})])) {
+    const a = (local.progress || {})[id] || {};
+    const b = (remote.progress || {})[id] || {};
+    progress[id] = {
+      level: maxNum(a.level, b.level),
+      bestAccuracy: Math.max(Number(a.bestAccuracy) || 0, Number(b.bestAccuracy) || 0),
+      sessions: maxNum(a.sessions, b.sessions),
+      lastAt: maxNum(a.lastAt, b.lastAt) || null,
+    };
+  }
+
+  // A note's record is a snapshot of one schedule, so take it whole from
+  // whichever side saw the note most recently rather than blending fields.
+  const notes = {};
+  for (const key of new Set([...Object.keys(local.notes || {}), ...Object.keys(remote.notes || {})])) {
+    const a = (local.notes || {})[key];
+    const b = (remote.notes || {})[key];
+    if (!a) notes[key] = b;
+    else if (!b) notes[key] = a;
+    else if ((a.lastAt || 0) !== (b.lastAt || 0)) notes[key] = (a.lastAt || 0) > (b.lastAt || 0) ? a : b;
+    else notes[key] = (a.reps || 0) >= (b.reps || 0) ? a : b;
+  }
+
+  const ls = local.stats || {};
+  const rs = remote.stats || {};
+  const dayCounts = {};
+  for (const day of new Set([...Object.keys(ls.dayCounts || {}), ...Object.keys(rs.dayCounts || {})])) {
+    dayCounts[day] = maxNum((ls.dayCounts || {})[day], (rs.dayCounts || {})[day]);
+  }
+
+  const seen = new Set();
+  const history = [...(ls.history || []), ...(rs.history || [])]
+    .filter((entry) => {
+      const id = `${entry.at}:${entry.lessonId || entry.title}`;
+      if (seen.has(id)) return false;
+      seen.add(id);
+      return true;
+    })
+    .sort((a, b) => b.at - a.at)
+    .slice(0, 60);
+
+  const lastPracticeDay =
+    !ls.lastPracticeDay || !rs.lastPracticeDay
+      ? ls.lastPracticeDay || rs.lastPracticeDay || null
+      : ls.lastPracticeDay > rs.lastPracticeDay
+      ? ls.lastPracticeDay
+      : rs.lastPracticeDay;
+
+  const stats = {
+    ...base.stats,
+    xp: maxNum(ls.xp, rs.xp),
+    sessions: maxNum(ls.sessions, rs.sessions),
+    prompts: maxNum(ls.prompts, rs.prompts),
+    correct: maxNum(ls.correct, rs.correct),
+    streak: maxNum(ls.streak, rs.streak),
+    longestStreak: maxNum(ls.longestStreak, rs.longestStreak),
+    lastPracticeDay,
+    dayCounts,
+    history,
+  };
+
+  return {
+    version: base.version,
+    updatedAt: Math.max(local.updatedAt || 0, remote.updatedAt || 0),
+    settings,
+    // Calibration is never synced, so it stays whatever this device measured.
+    calibration: local.calibration || base.calibration,
+    progress,
+    notes,
+    stats,
+  };
+}
+
+/** Replace the running state, e.g. after merging in a profile from Supabase. */
+export function adoptState(next) {
+  state = { ...blank(), ...next, calibration: state.calibration };
+  saveNow();
+  return state;
+}
+
+/** True when nothing has been practised on this device yet. */
+export function isEmptyProgress(source = state) {
+  return (
+    Object.keys(source.notes || {}).length === 0 &&
+    Object.keys(source.progress || {}).length === 0 &&
+    !(source.stats && source.stats.xp)
+  );
 }
 
 /** XP curve: level N needs 100 + 60*(N-1) XP on top of the previous level. */

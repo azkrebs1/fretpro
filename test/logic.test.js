@@ -21,6 +21,7 @@ import { grade, newRecord, mastery, isDue, pickNext, MAX_BOX, FLUENT_MS } from '
 import { detectPitch, computeRms, isPitchStable, PitchEngine, SENSITIVITY } from '../js/audio.js';
 import { Session } from '../js/session.js';
 import * as store from '../js/store.js';
+import * as cloud from '../js/cloud.js';
 
 /* ---------- theory ---------------------------------------------------- */
 
@@ -368,6 +369,120 @@ test('stability looks only at the most recent readings', () => {
 test('rms is the plain root-mean-square', () => {
   assert.equal(computeRms(new Float32Array([1, -1, 1, -1])), 1);
   assert.equal(computeRms(new Float32Array(64)), 0);
+});
+
+/* ---------- accounts and cloud saves ---------------------------------- */
+
+test('usernames are normalised and checked the same way the database does it', () => {
+  assert.equal(cloud.normalizeUsername('  AZ_Krebs '), 'az_krebs');
+  assert.equal(cloud.validateUsername('az').ok, true);
+  assert.equal(cloud.validateUsername('  AZ  ').username, 'az');
+  assert.equal(cloud.validateUsername('a').ok, false, 'one character is too short');
+  assert.equal(cloud.validateUsername('x'.repeat(25)).ok, false, '25 characters is too long');
+  assert.equal(cloud.validateUsername('has space').ok, false);
+  assert.equal(cloud.validateUsername('drop;table').ok, false);
+  assert.equal(cloud.validateUsername('').ok, false);
+  assert.equal(cloud.validateUsername(null).ok, false);
+  assert.equal(cloud.validateUsername('good-name_9').ok, true);
+});
+
+test('the upload leaves microphone calibration and the device id behind', () => {
+  store.resetAll();
+  store.setCalibration({ gate: 0.02, noiseFloor: 0.004 });
+  store.setSetting('deviceId', 'this-laptop');
+  const payload = store.syncPayload();
+  assert.equal(payload.calibration, undefined, 'a gate measured on one mic is wrong on another');
+  assert.equal(payload.settings.deviceId, undefined);
+  assert.ok(payload.stats && payload.progress && payload.notes);
+  store.resetAll();
+});
+
+function stateWith({ xp = 0, notes = {}, progress = {}, updatedAt = 1000, settings = {} } = {}) {
+  return {
+    version: 1,
+    updatedAt,
+    settings: { timerSeconds: 6, ...settings },
+    calibration: {},
+    progress,
+    notes,
+    stats: { xp, sessions: 0, prompts: 0, correct: 0, streak: 0, longestStreak: 0, lastPracticeDay: null, dayCounts: {}, history: [] },
+  };
+}
+
+test('merging two devices keeps the best of each, never the smaller', () => {
+  const local = stateWith({ xp: 300, progress: { 's6-g1': { level: 3, sessions: 5, bestAccuracy: 0.9, lastAt: 50 } } });
+  const remote = stateWith({ xp: 120, progress: { 's6-g1': { level: 1, sessions: 9, bestAccuracy: 0.7, lastAt: 20 } } });
+  const merged = store.mergeStates(local, remote);
+  assert.equal(merged.stats.xp, 300, 'XP must not go backwards');
+  assert.equal(merged.progress['s6-g1'].level, 3, 'a cleared level must not be un-cleared');
+  assert.equal(merged.progress['s6-g1'].sessions, 9, 'session counts take the higher side');
+});
+
+test('a note record comes from whichever device saw it more recently', () => {
+  const older = { box: 1, reps: 2, correct: 1, lapses: 1, avgMs: 4000, due: 10, lastAt: 100, recent: [0, 1] };
+  const newer = { box: 4, reps: 9, correct: 9, lapses: 0, avgMs: 900, due: 99, lastAt: 500, recent: [1, 1, 1] };
+  const merged = store.mergeStates(
+    stateWith({ notes: { s6f0: older } }),
+    stateWith({ notes: { s6f0: newer } })
+  );
+  assert.deepEqual(merged.notes.s6f0, newer, 'the whole record moves together, not field by field');
+});
+
+test('merging brings across notes that only one side has ever seen', () => {
+  const merged = store.mergeStates(
+    stateWith({ notes: { s6f0: { box: 1, reps: 1, lastAt: 5, recent: [1] } } }),
+    stateWith({ notes: { s5f3: { box: 2, reps: 4, lastAt: 7, recent: [1] } } })
+  );
+  assert.deepEqual(Object.keys(merged.notes).sort(), ['s5f3', 's6f0']);
+});
+
+test('settings follow the device that saved most recently', () => {
+  const older = stateWith({ updatedAt: 100, settings: { timerSeconds: 6 } });
+  const newer = stateWith({ updatedAt: 900, settings: { timerSeconds: 3 } });
+  assert.equal(store.mergeStates(older, newer).settings.timerSeconds, 3);
+  assert.equal(store.mergeStates(newer, older).settings.timerSeconds, 3);
+});
+
+test('the local calibration always survives a merge', () => {
+  const local = { ...stateWith({}), calibration: { gate: 0.03, noiseFloor: 0.005 } };
+  const remote = { ...stateWith({ updatedAt: 99999 }), calibration: { gate: 0.9, noiseFloor: 0.5 } };
+  assert.deepEqual(store.mergeStates(local, remote).calibration, { gate: 0.03, noiseFloor: 0.005 });
+});
+
+test('session history is combined without duplicating the same session twice', () => {
+  const entry = { at: 500, lessonId: 's6-g1', title: 'E F G', accuracy: 1, prompts: 12, avgMs: 900, xp: 30 };
+  const other = { at: 700, lessonId: 's6-g2', title: 'A B C', accuracy: 0.8, prompts: 12, avgMs: 1200, xp: 25 };
+  const local = stateWith({});
+  local.stats.history = [entry];
+  const remote = stateWith({});
+  remote.stats.history = [other, entry];
+  const merged = store.mergeStates(local, remote);
+  assert.equal(merged.stats.history.length, 2);
+  assert.equal(merged.stats.history[0].at, 700, 'newest first');
+});
+
+test('merging against nothing is a no-op in both directions', () => {
+  const local = stateWith({ xp: 40 });
+  assert.equal(store.mergeStates(local, null), local);
+  assert.equal(store.mergeStates(null, local), local);
+});
+
+test('a device that has never practised is recognised as empty', () => {
+  store.resetAll();
+  assert.equal(store.isEmptyProgress(), true);
+  store.addXp(10);
+  assert.equal(store.isEmptyProgress(), false);
+  store.resetAll();
+});
+
+test('signing in is refused before a project is connected', async () => {
+  assert.equal(cloud.isCloudConfigured(), false, 'no credentials are committed to the repo');
+  await assert.rejects(() => cloud.signIn('someone'), /not configured/i);
+});
+
+test('a bad username is rejected before any network call', async () => {
+  await assert.rejects(() => cloud.signIn('no'.repeat(40)), /too long/i);
+  await assert.rejects(() => cloud.signIn('bad name'), /letters, numbers/i);
 });
 
 /* ---------- not answering with the wrong sound ------------------------ */

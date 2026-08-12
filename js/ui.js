@@ -7,6 +7,8 @@ import { mastery, isDue } from './srs.js';
 import { PitchEngine, playNoteTone, playLevelUp, onSelfNoise, SENSITIVITY } from './audio.js';
 import { createFretboard, noteBadge } from './fretboard.js';
 import { Session, effectiveTimer } from './session.js';
+import * as cloud from './cloud.js';
+import { supabaseConfig, writeOverride } from './config.js';
 
 /* ---------- tiny DOM helper ------------------------------------------ */
 
@@ -154,6 +156,7 @@ export function renderRail() {
   const rail = $('#railStats');
   rail.textContent = '';
   rail.append(
+    accountChip(),
     h('div', { class: 'stat-chip', title: `${s.xp} XP total` }, [
       h('b', { text: `L${lvl.level}` }),
       h('span', { text: 'level' }),
@@ -167,6 +170,44 @@ export function renderRail() {
       h('span', { text: 'today' }),
     ])
   );
+}
+
+const SYNC_LOOK = {
+  off: { dot: '', label: 'local only', title: 'Cloud saves are not set up — progress stays in this browser.' },
+  idle: { dot: '', label: 'not signed in', title: 'Sign in from Setup to save progress across devices.' },
+  syncing: { dot: 'is-syncing', label: 'syncing…', title: 'Talking to the server.' },
+  saved: { dot: 'is-ok', label: 'saved', title: 'Progress is saved to your account.' },
+  offline: { dot: 'is-warn', label: 'offline', title: 'No connection — progress is safe locally and will sync later.' },
+  error: { dot: 'is-bad', label: 'sync failed', title: 'Could not reach the server.' },
+};
+
+/** Small account/sync indicator that lives in the top rail. */
+function accountChip() {
+  const status = cloud.syncStatus();
+  const look = SYNC_LOOK[status.state] || SYNC_LOOK.idle;
+  const user = cloud.currentUser();
+  const chip = h(
+    'button',
+    {
+      class: 'account-chip',
+      type: 'button',
+      title: status.message || look.title,
+      onclick: () => {
+        renderSetup();
+        showScreen('setup');
+        const panel = document.getElementById('accountPanel');
+        if (panel) panel.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      },
+    },
+    [
+      h('span', { class: `sync-dot ${look.dot}` }),
+      h('span', { class: 'account-chip-text' }, [
+        h('b', { text: user ? `@${user}` : 'Guest' }),
+        h('span', { text: user ? look.label : look.label }),
+      ]),
+    ]
+  );
+  return chip;
 }
 
 function setMicPlate(text, live = false) {
@@ -1168,6 +1209,8 @@ export function renderSetup() {
 
   root.append(h('div', { class: 'eyebrow', text: 'Signal and preferences' }), h('h1', { text: 'Setup' }));
 
+  root.appendChild(renderAccountPanel());
+
   /* --- microphone panel --- */
   const micStatus = h('p', {
     class: 'lede',
@@ -1414,6 +1457,189 @@ function toleranceHelpText(cents) {
   return `${flavour} A note this far off the target still counts, leaving ${margin} cents of margin before the next fret would be accepted too.`;
 }
 
+/* ---------- account panel --------------------------------------------- */
+
+function renderAccountPanel() {
+  const panel = h('div', { class: 'panel', id: 'accountPanel', style: 'margin-top:18px' });
+  const configured = cloud.isCloudConfigured();
+  const user = cloud.currentUser();
+
+  panel.append(h('div', { class: 'eyebrow', text: 'Account' }), h('h2', { text: 'Cloud saves', style: 'margin:6px 0 10px' }));
+
+  if (!configured) {
+    panel.append(
+      h('p', { class: 'lede', text: 'Not connected. Progress is saved in this browser only, which is all you need on one machine.' }),
+      h('div', { class: 'banner' }, [
+        h('b', { text: 'To turn it on' }),
+        'Create a Supabase project, run supabase/schema.sql in its SQL editor, then paste the project URL and anon key into js/config.js — or below, to try it without redeploying.',
+      ]),
+      connectForm()
+    );
+    return panel;
+  }
+
+  if (!user) {
+    const input = h('input', {
+      type: 'text',
+      placeholder: 'e.g. az',
+      autocomplete: 'off',
+      autocapitalize: 'none',
+      spellcheck: 'false',
+      maxlength: '24',
+      style: 'max-width:260px',
+    });
+    const message = h('div', { class: 'help' });
+    const button = h('button', { class: 'btn is-primary' }, ['Sign in']);
+
+    const submit = async () => {
+      const check = cloud.validateUsername(input.value);
+      if (!check.ok) {
+        message.textContent = check.reason;
+        return;
+      }
+      button.disabled = true;
+      button.textContent = 'Signing in…';
+      message.textContent = '';
+      try {
+        const { username, outcome } = await cloud.signIn(input.value);
+        toast(
+          outcome === 'created'
+            ? `Created @${username} — this device's progress is now saved to it.`
+            : outcome === 'pulled'
+            ? `Welcome back, @${username}. Progress restored.`
+            : `Signed in as @${username}. Progress from this device was merged in.`,
+          'good'
+        );
+        renderAll();
+        showScreen('setup');
+      } catch (err) {
+        message.textContent = err.message;
+        button.disabled = false;
+        button.textContent = 'Sign in';
+      }
+    };
+
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') submit();
+    });
+    button.addEventListener('click', submit);
+
+    panel.append(
+      h('p', { class: 'lede', text: 'Pick a username and your progress follows you to any device. No password, no email.' }),
+      h('div', { class: 'field' }, [
+        h('label', { text: 'Username' }),
+        h('div', { style: 'display:flex;gap:10px;flex-wrap:wrap' }, [input, button]),
+        message,
+        h('div', { class: 'help', text: 'A name nobody has used yet becomes yours, starting from whatever is already on this device. An existing name loads its progress and merges this device into it.' }),
+      ]),
+      h('div', { class: 'banner is-bad' }, [
+        h('b', { text: 'No password means no privacy' }),
+        'Anyone who guesses your username can load and overwrite this profile. That is the trade for signing in without one, so keep it to practice progress and pick a name that is not obvious if that matters to you.',
+      ]),
+      connectForm()
+    );
+    return panel;
+  }
+
+  const status = cloud.syncStatus();
+  const look = SYNC_LOOK[status.state] || SYNC_LOOK.idle;
+  const statusLine = h('div', { class: 'help', id: 'accountStatus' }, [
+    h('span', { class: `sync-dot ${look.dot}` }),
+    ` ${status.message || look.title}`,
+  ]);
+
+  panel.append(
+    h('div', { class: 'result-grid', style: 'margin:8px 0 4px' }, [
+      h('div', { class: 'tile is-accent' }, [h('span', { text: 'Signed in as' }), h('b', { text: `@${user}` })]),
+      h('div', { class: 'tile' }, [
+        h('span', { text: 'Last sync' }),
+        h('b', { text: status.at ? new Date(status.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—' }),
+        h('small', { text: look.label }),
+      ]),
+    ]),
+    statusLine,
+    h('div', { class: 'btn-row', style: 'margin-top:16px' }, [
+      h(
+        'button',
+        {
+          class: 'btn',
+          onclick: async (e) => {
+            const b = e.currentTarget;
+            b.disabled = true;
+            b.textContent = 'Syncing…';
+            await cloud.pullNow();
+            renderAll();
+            showScreen('setup');
+            toast('Synced.', 'good');
+          },
+        },
+        ['Sync now']
+      ),
+      h(
+        'button',
+        {
+          class: 'btn is-ghost',
+          onclick: () =>
+            openSheet(
+              `Sign out of @${user}?`,
+              ['Progress stays on this device and stays on the server. Sign back in with the same username to pick it up anywhere.'],
+              [
+                h('button', { class: 'btn is-danger', onclick: () => { cloud.signOut(); closeSheet(); renderAll(); showScreen('setup'); toast('Signed out.'); } }, ['Sign out']),
+                h('button', { class: 'btn is-ghost', onclick: closeSheet }, ['Cancel']),
+              ]
+            ),
+        },
+        ['Sign out']
+      ),
+    ])
+  );
+  return panel;
+}
+
+/** Lets you point the app at a Supabase project without editing config.js. */
+function connectForm() {
+  const cfg = supabaseConfig();
+  const urlInput = h('input', { type: 'text', placeholder: 'https://xxxx.supabase.co', value: cfg.fromOverride ? cfg.url : '' });
+  const keyInput = h('input', { type: 'text', placeholder: 'anon / publishable key', value: cfg.fromOverride ? cfg.key : '' });
+
+  return h('details', { style: 'margin-top:18px' }, [
+    h('summary', { class: 'eyebrow', style: 'cursor:pointer', text: cfg.fromOverride ? 'Connection (set on this device)' : 'Connect a project from here' }),
+    h('div', { style: 'margin-top:12px' }, [
+      h('div', { class: 'field' }, [h('label', { text: 'Project URL' }), urlInput]),
+      h('div', { class: 'field' }, [h('label', { text: 'Anon key' }), keyInput]),
+      h('div', { class: 'help', style: 'margin-bottom:12px', text: 'Stored in this browser only. Putting the same values in js/config.js makes them apply everywhere the site is deployed.' }),
+      h('div', { class: 'btn-row' }, [
+        h(
+          'button',
+          {
+            class: 'btn',
+            onclick: () => {
+              writeOverride(urlInput.value, keyInput.value);
+              toast('Connection saved. Reloading.', 'good');
+              setTimeout(() => location.reload(), 600);
+            },
+          },
+          ['Save and reload']
+        ),
+        cfg.fromOverride
+          ? h(
+              'button',
+              {
+                class: 'btn is-ghost',
+                onclick: () => {
+                  writeOverride(null, null);
+                  toast('Connection cleared. Reloading.');
+                  setTimeout(() => location.reload(), 600);
+                },
+              },
+              ['Clear']
+            )
+          : null,
+      ]),
+    ]),
+  ]);
+}
+
 function sensitivityHelpText(key) {
   const preset = SENSITIVITY[key] || SENSITIVITY.normal;
   const hold = Math.round((preset.stableFrames / 60) * 1000);
@@ -1511,6 +1737,14 @@ export function renderAll() {
 export function boot() {
   renderAll();
   showScreen('path');
+
+  // Keep the rail's account chip honest as sync comes and goes.
+  cloud.onStatus(() => {
+    renderRail();
+    const line = document.getElementById('accountStatus');
+    if (line && currentScreen === 'setup') renderSetup();
+  });
+  cloud.startSync();
 
   document.querySelectorAll('.navbtn').forEach((btn) => {
     btn.addEventListener('click', () => {

@@ -1,0 +1,54 @@
+/* Supabase connection.
+ *
+ * Paste the two values from your Supabase project below:
+ *   Project Settings → API → Project URL, and the `anon` / publishable key.
+ *
+ * The anon key is designed to sit in client code — it identifies the project,
+ * it does not grant access on its own. What actually guards the data is the
+ * SQL in supabase/schema.sql, which keeps the table itself unreadable and
+ * exposes only two functions that need an exact username.
+ *
+ * Leave these blank and the app runs exactly as before, entirely on this
+ * device, with the account panel showing that cloud saves are switched off.
+ */
+
+export const SUPABASE_URL = '';
+export const SUPABASE_ANON_KEY = '';
+
+/** Lets you try a project without editing this file — Setup → Account. */
+const OVERRIDE_KEY = 'fretpro.supabase';
+
+export function readOverride() {
+  try {
+    const raw = typeof localStorage === 'undefined' ? null : localStorage.getItem(OVERRIDE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch (err) {
+    return null;
+  }
+}
+
+export function writeOverride(url, key) {
+  try {
+    if (!url || !key) localStorage.removeItem(OVERRIDE_KEY);
+    else localStorage.setItem(OVERRIDE_KEY, JSON.stringify({ url: url.trim(), key: key.trim() }));
+  } catch (err) {
+    /* private browsing — the constants above still work */
+  }
+}
+
+/** The connection actually in use: the override if set, otherwise the constants. */
+export function supabaseConfig() {
+  const override = readOverride();
+  const url = (override && override.url) || SUPABASE_URL;
+  const key = (override && override.key) || SUPABASE_ANON_KEY;
+  return {
+    url: (url || '').replace(/\/+$/, ''),
+    key: key || '',
+    fromOverride: Boolean(override && override.url && override.key),
+  };
+}
+
+export function isCloudConfigured() {
+  const { url, key } = supabaseConfig();
+  return Boolean(url && key);
+}

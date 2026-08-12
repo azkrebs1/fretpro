@@ -197,6 +197,83 @@ button {
   color: var(--sapphire);
 }
 
+/* account + sync indicator */
+.account-chip {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  background: none;
+  border: 1px solid var(--edge);
+  border-radius: var(--r-sm);
+  padding: 5px 10px;
+  transition: border-color 0.15s ease;
+}
+
+.account-chip:hover {
+  border-color: var(--sapphire-bright);
+}
+
+.account-chip-text {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.15;
+  text-align: left;
+}
+
+.account-chip-text b {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.account-chip-text span {
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+.sync-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--ink-faint);
+  opacity: 0.5;
+}
+
+.sync-dot.is-ok {
+  background: var(--green);
+  opacity: 1;
+}
+
+.sync-dot.is-warn {
+  background: var(--meter-amber);
+  opacity: 1;
+}
+
+.sync-dot.is-bad {
+  background: var(--red);
+  opacity: 1;
+}
+
+.sync-dot.is-syncing {
+  background: var(--sapphire-bright);
+  opacity: 1;
+  animation: pulse-dot 1s ease-in-out infinite;
+}
+
+@keyframes pulse-dot {
+  50% {
+    opacity: 0.3;
+  }
+}
+
+details summary::marker {
+  color: var(--ink-faint);
+}
+
 /* ---------- Screens --------------------------------------------------- */
 
 .deck {

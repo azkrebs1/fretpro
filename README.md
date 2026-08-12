@@ -18,8 +18,67 @@ The microphone only works on a secure origin. `http://localhost` counts as one;
 double-clicking `index.html` does not, so use the server. Any static server works —
 `python -m http.server 5173` is equivalent.
 
-Progress lives in the browser's localStorage, so use the same browser each time.
-Setup → Data has export and import if you want a backup.
+Progress lives in the browser's localStorage. Connect Supabase (below) and it
+follows you between devices instead. Setup → Data still has export and import.
+
+## Cloud saves (optional)
+
+Sign in with a username, no password, and progress syncs everywhere.
+
+**1. Make a Supabase project** at supabase.com — the free tier is plenty.
+
+**2. Run the schema.** SQL Editor → New query → paste all of `supabase/schema.sql`
+→ Run. This creates the `profiles` table and the two functions the app calls.
+
+**3. Connect it.** Project Settings → API, then either paste the Project URL and
+the `anon` key into `js/config.js`, or paste them into Setup → Account → *Connect
+a project from here* to try it on one device without redeploying.
+
+Then Setup → Account → pick a username. A name nobody has used becomes yours,
+starting from whatever is already on this device. An existing name loads its
+progress and merges this device into it.
+
+### What syncing does and does not do
+
+localStorage stays the source of truth while you practise, so sessions never
+block on the network and everything works offline; the server is a sync target
+that gets a debounced push after changes and a flush when the tab closes.
+
+Two devices used offline both keep their work — merging takes the better value
+per field rather than letting the last device to sync overwrite the other. Levels
+never go down, XP never shrinks, and each note's schedule comes from whichever
+device saw it most recently. **Microphone calibration never syncs**: a noise gate
+measured on one laptop's mic is wrong on another.
+
+### The security trade
+
+Signing in with a username and no password means exactly what it sounds like:
+**anyone who knows your username can load and overwrite that profile.** There is
+no way around that while keeping passwordless sign-in, so keep it to practice
+progress and pick a name that is not obvious if that matters to you.
+
+What the schema does prevent is bulk access. The `profiles` table has row level
+security on with no policies, so the anon key cannot read or write it directly at
+all. The only way in is `get_profile` and `save_profile`, both of which need an
+exact username — nobody can list who exists or dump every row. Deletes are not
+exposed at all.
+
+The anon key belongs in client code; it identifies the project and grants nothing
+on its own. The SQL is what guards the data.
+
+## Deploying
+
+The repo is already a static site with no build step, so any host works.
+
+**Vercel, from the GitHub repo** — import `azkrebs1/fretpro` at vercel.com/new and
+deploy. `vercel.json` already tells it there is no build. Pushes to `main` then
+redeploy automatically.
+
+**Vercel, from the CLI** — `npx vercel` in this folder, then `npx vercel --prod`.
+
+Microphone access needs HTTPS, which any Vercel URL gives you. If you use the
+Setup → Account connect form rather than `js/config.js`, remember it is per
+browser, so the deployed site needs its own connection or the values committed.
 
 ## How practice works
 
@@ -97,19 +156,23 @@ Same lessons, same scheduling, same progress — useful on a train.
 ## Layout
 
 ```
-index.html          shell and screen containers
-css/app.css         the whole visual system
-js/theory.js        tuning, note naming, fretboard math
-js/curriculum.js    the unit/lesson path
-js/srs.js           spaced repetition and mastery scoring
-js/store.js         localStorage persistence
-js/audio.js         mic capture, calibration, YIN pitch detection
-js/fretboard.js     SVG board: prompts, tap input, heat map
-js/session.js       the prompt/judge/advance loop
-js/ui.js            screens and wiring
-js/main.js          boot
-server.js           zero-dependency static server
-test/logic.test.js  node --test
+index.html            shell and screen containers
+css/app.css           the whole visual system
+js/theory.js          tuning, note naming, fretboard math
+js/curriculum.js      the unit/lesson path
+js/srs.js             spaced repetition and mastery scoring
+js/store.js           persistence, and the two-device merge
+js/config.js          Supabase URL and key
+js/cloud.js           sign-in and sync
+js/audio.js           mic capture, calibration, YIN pitch detection
+js/fretboard.js       SVG board: prompts, tap input, heat map
+js/session.js         the prompt/judge/advance loop
+js/ui.js              screens and wiring
+js/main.js            boot
+supabase/schema.sql   table, functions and grants
+server.js             zero-dependency static server for local use
+vercel.json           static deploy config
+test/logic.test.js    node --test
 ```
 
 ## Tests
