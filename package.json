@@ -1,0 +1,11 @@
+{
+  "name": "fretpro",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Learn every note on the guitar fretboard, three at a time, with your guitar as the input device.",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test/logic.test.js"
+  }
+}

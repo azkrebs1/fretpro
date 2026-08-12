@@ -1,0 +1,1548 @@
+/* Screens, rendering and wiring. */
+
+import { midiAt, noteName, splitName, posKey, parsePosKey, isNatural, TUNINGS, MAX_FRET } from './theory.js';
+import { LESSONS, LESSON_BY_ID, UNITS, MAX_LEVEL, levelSpec, ALL_POSITIONS, poolPitchClasses } from './curriculum.js';
+import * as store from './store.js';
+import { mastery, isDue } from './srs.js';
+import { PitchEngine, playNoteTone, playLevelUp, onSelfNoise, SENSITIVITY } from './audio.js';
+import { createFretboard, noteBadge } from './fretboard.js';
+import { Session, effectiveTimer } from './session.js';
+
+/* ---------- tiny DOM helper ------------------------------------------ */
+
+export function h(tag, props = {}, children = []) {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(props)) {
+    if (v == null || v === false) continue;
+    if (k === 'class') node.className = v;
+    else if (k === 'html') node.innerHTML = v;
+    else if (k === 'text') node.textContent = v;
+    else if (k.startsWith('on') && typeof v === 'function') node.addEventListener(k.slice(2).toLowerCase(), v);
+    else if (k === 'dataset') Object.assign(node.dataset, v);
+    else node.setAttribute(k, v === true ? '' : String(v));
+  }
+  for (const child of [].concat(children)) {
+    if (child == null || child === false) continue;
+    node.appendChild(typeof child === 'string' ? document.createTextNode(child) : child);
+  }
+  return node;
+}
+
+const $ = (sel) => document.querySelector(sel);
+const pct = (v) => `${Math.round(v * 100)}%`;
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+/* ---------- module state --------------------------------------------- */
+
+export const engine = new PitchEngine();
+
+// Anything the app plays comes back through the speakers, so stop listening
+// for as long as it sounds. Without this the app answers its own prompts.
+onSelfNoise((ms) => engine.suppress(ms));
+let activeSession = null;
+let sessionBoard = null;
+let progressBoard = null;
+let meterUnsub = null;
+let currentScreen = 'path';
+let pendingStart = null; // session config waiting on calibration
+
+/* ---------- screen switching ----------------------------------------- */
+
+export function showScreen(name) {
+  currentScreen = name;
+  document.querySelectorAll('.screen').forEach((s) => s.classList.remove('is-active'));
+  const el = $(`#screen-${name}`);
+  if (el) el.classList.add('is-active');
+  document.querySelectorAll('.navbtn').forEach((b) => b.classList.toggle('is-active', b.dataset.screen === name));
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+export function toast(message, kind = '') {
+  const node = h('div', { class: `toast ${kind ? `is-${kind}` : ''}`, text: message });
+  $('#toasts').appendChild(node);
+  setTimeout(() => {
+    node.style.opacity = '0';
+    node.style.transition = 'opacity .3s';
+    setTimeout(() => node.remove(), 320);
+  }, 3200);
+}
+
+export function openSheet(title, body, actions = []) {
+  const card = $('#sheetCard');
+  card.textContent = '';
+  card.appendChild(h('h2', { id: 'sheetTitle', text: title }));
+  for (const b of [].concat(body)) card.appendChild(typeof b === 'string' ? h('p', { class: 'lede', text: b }) : b);
+  if (actions.length) card.appendChild(h('div', { class: 'btn-row', style: 'margin-top:18px' }, actions));
+  $('#sheet').hidden = false;
+}
+
+export function closeSheet() {
+  $('#sheet').hidden = true;
+}
+
+/* ---------- naming helpers ------------------------------------------- */
+
+function nameOf(string, fret) {
+  const s = store.settings();
+  return noteName(midiAt(s.tuning, string, fret), s.spelling);
+}
+
+function shortName(string, fret) {
+  return nameOf(string, fret).split('/')[0];
+}
+
+/** Lesson titles follow the tuning, so they stay true if you retune. */
+function lessonTitle(lesson) {
+  if (!lesson.milestone && lesson.newNotes.length <= 3) {
+    return lesson.newNotes.map((n) => shortName(n.string, n.fret)).join(' · ');
+  }
+  return lesson.title;
+}
+
+function nodeLabel(lesson) {
+  if (lesson.milestone) return 'ALL';
+  if (lesson.newNotes.length <= 3) return lesson.newNotes.map((n) => shortName(n.string, n.fret).replace('#', '♯')).join('');
+  return String(lesson.newNotes.length);
+}
+
+function glyphFor(name) {
+  const { letter, accidental } = splitName(name);
+  return h('div', { class: 'glyph' }, [letter, accidental ? h('sup', { text: accidental }) : null]);
+}
+
+/* ---------- progress helpers ----------------------------------------- */
+
+export function lessonState(lesson) {
+  const prog = store.lessonProgress(lesson.id);
+  const prevDone = !lesson.requires || store.lessonProgress(lesson.requires).level >= 1;
+  if (prog.level >= MAX_LEVEL) return 'done';
+  if (prog.level >= 1) return 'started';
+  return prevDone ? 'next' : 'locked';
+}
+
+function firstOpenLesson() {
+  return LESSONS.find((l) => lessonState(l) === 'next' || lessonState(l) === 'started') || LESSONS[LESSONS.length - 1];
+}
+
+function masteryFor(string, fret) {
+  return mastery(store.noteRecord(posKey(string, fret)));
+}
+
+function overallMastery() {
+  const total = ALL_POSITIONS.reduce((acc, n) => acc + masteryFor(n.string, n.fret), 0);
+  return total / ALL_POSITIONS.length;
+}
+
+/** Positions the learner has actually met, for review drills. */
+function seenPositions() {
+  return Object.keys(store.allNoteRecords())
+    .map(parsePosKey)
+    .filter(Boolean);
+}
+
+function duePositions() {
+  return seenPositions().filter((n) => isDue(store.noteRecord(posKey(n.string, n.fret))));
+}
+
+/* ---------- rail ------------------------------------------------------ */
+
+export function renderRail() {
+  const s = store.stats();
+  const lvl = store.levelFromXp(s.xp);
+  const streak = store.currentStreak();
+  const today = s.dayCounts[store.todayKey()] || 0;
+  const rail = $('#railStats');
+  rail.textContent = '';
+  rail.append(
+    h('div', { class: 'stat-chip', title: `${s.xp} XP total` }, [
+      h('b', { text: `L${lvl.level}` }),
+      h('span', { text: 'level' }),
+    ]),
+    h('div', { class: `stat-chip ${streak > 0 ? 'is-hot' : ''}`, title: 'Days in a row with practice' }, [
+      h('b', { text: String(streak) }),
+      h('span', { text: 'streak' }),
+    ]),
+    h('div', { class: 'stat-chip', title: 'Notes answered today' }, [
+      h('b', { text: String(today) }),
+      h('span', { text: 'today' }),
+    ])
+  );
+}
+
+function setMicPlate(text, live = false) {
+  $('#plateMic').textContent = text;
+  $('#jewel').classList.toggle('is-live', live);
+}
+
+/* ---------- path screen ---------------------------------------------- */
+
+export function renderPath() {
+  const root = $('#screen-path');
+  root.textContent = '';
+
+  const open = firstOpenLesson();
+  const s = store.stats();
+  const goalDone = Math.min(store.settings().dailyGoal, countTodaySessions());
+  const overall = overallMastery();
+
+  root.appendChild(
+    h('div', { class: 'path-head' }, [
+      h('div', {}, [
+        h('div', { class: 'eyebrow', text: 'Learn the neck, three notes at a time' }),
+        h('h1', { text: 'The path' }),
+        h('p', { class: 'lede', text: 'Each stop adds three notes on one string. Clear it and the next unlocks. Nothing is ever dropped — old notes keep coming back on their own schedule.' }),
+      ]),
+      h('div', { class: 'goal' }, [
+        h('div', { class: 'eyebrow', text: `Today · ${goalDone} of ${store.settings().dailyGoal} sessions` }),
+        h('div', { class: 'goal-bar' }, [h('i', { style: `width:${pct(clamp(goalDone / Math.max(1, store.settings().dailyGoal), 0, 1))}` })]),
+        h('div', { class: 'eyebrow', style: 'margin-top:10px', text: `Fretboard mastered · ${pct(overall)}` }),
+        h('div', { class: 'goal-bar' }, [h('i', { style: `width:${pct(overall)}` })]),
+      ]),
+    ])
+  );
+
+  root.appendChild(
+    h('div', { class: 'btn-row', style: 'margin-bottom:8px' }, [
+      h('button', { class: 'btn is-primary', onclick: () => startLesson(open.id) }, [
+        `Continue · ${lessonTitle(open)}`,
+      ]),
+      h('button', { class: 'btn is-ghost', onclick: () => startReview() }, [`Review due (${duePositions().length})`]),
+    ])
+  );
+
+  const neck = h('div', { class: 'neck' });
+  UNITS.forEach((unit, ui) => {
+    const unitLessons = LESSONS.filter((l) => l.unitId === unit.id);
+    const locked = unitLessons.every((l) => lessonState(l) === 'locked');
+    const unitEl = h('section', { class: `neck-unit ${locked ? 'unit-locked' : ''}` }, [
+      h('div', { class: 'unit-head' }, [
+        h('span', { class: 'unit-num', text: String(ui + 1).padStart(2, '0') }),
+        h('h2', { text: unit.title }),
+        h('p', { text: locked ? 'Locked — finish the unit above' : unit.blurb }),
+      ]),
+    ]);
+
+    const strip = h('div', { class: 'neck-strip' });
+    unitLessons.forEach((lesson, li) => {
+      const state = lessonState(lesson);
+      const prog = store.lessonProgress(lesson.id);
+      const side = li % 2 === 0 ? 'on-right' : 'on-left';
+      const btn = h(
+        'button',
+        {
+          type: 'button',
+          class: `node ${state === 'locked' ? 'is-locked' : ''} ${state === 'next' ? 'is-next' : ''} ${
+            state === 'done' ? 'is-done' : ''
+          } ${lesson.milestone ? 'is-milestone' : ''}`,
+          disabled: state === 'locked',
+          'aria-label': `${lessonTitle(lesson)} — ${lesson.subtitle}`,
+          onclick: () => openLessonSheet(lesson.id),
+        },
+        [
+          h('span', { class: 'node-label', text: nodeLabel(lesson) }),
+          h(
+            'span',
+            { class: 'node-pips' },
+            [0, 1, 2].map((i) => h('i', { class: i < prog.level ? 'is-on' : '' }))
+          ),
+        ]
+      );
+
+      strip.appendChild(
+        h('div', { class: 'node-row' }, [
+          btn,
+          h('div', { class: `node-caption ${side}` }, [
+            h('b', { text: lessonTitle(lesson) }),
+            lesson.subtitle,
+            h('em', { text: state === 'locked' ? ' · locked' : ` · level ${prog.level}/${MAX_LEVEL}` }),
+          ]),
+        ])
+      );
+    });
+
+    unitEl.appendChild(strip);
+    neck.appendChild(unitEl);
+  });
+
+  root.appendChild(neck);
+}
+
+function countTodaySessions() {
+  const today = store.todayKey();
+  return store.stats().history.filter((entry) => store.todayKey(new Date(entry.at)) === today).length;
+}
+
+function openLessonSheet(lessonId) {
+  const lesson = LESSON_BY_ID.get(lessonId);
+  const state = lessonState(lesson);
+  if (state === 'locked') return;
+  const prog = store.lessonProgress(lessonId);
+  const target = Math.min(MAX_LEVEL, prog.level + 1);
+  const spec = levelSpec(target - 1);
+  const timer = effectiveTimer(store.settings().timerSeconds, target);
+
+  const badges = h(
+    'div',
+    { class: 'badge-row' },
+    lesson.pool.slice(0, 14).map((n) => noteBadge(store.settings().tuning, n.string, n.fret, store.settings().spelling))
+  );
+
+  openSheet(
+    lessonTitle(lesson),
+    [
+      h('p', { class: 'lede', text: lesson.subtitle }),
+      h('div', { class: 'result-grid', style: 'margin:16px 0 6px' }, [
+        h('div', { class: 'tile' }, [h('span', { text: 'Level' }), h('b', { text: `${prog.level}/${MAX_LEVEL}` }), h('small', { text: spec.label })]),
+        h('div', { class: 'tile' }, [h('span', { text: 'Prompts' }), h('b', { text: String(spec.prompts) })]),
+        h('div', { class: 'tile' }, [
+          h('span', { text: 'Clock' }),
+          h('b', { text: timer ? `${timer}s` : '∞' }),
+          h('small', { text: `pass at ${pct(spec.minAccuracy)}` }),
+        ]),
+      ]),
+      h('div', { class: 'eyebrow', style: 'margin-top:14px', text: `Notes in play (${lesson.pool.length})` }),
+      badges,
+    ],
+    [
+      h('button', { class: 'btn is-primary', onclick: () => { closeSheet(); startLesson(lessonId); } }, [
+        prog.level >= MAX_LEVEL ? 'Practice again' : `Start level ${target}`,
+      ]),
+      h('button', { class: 'btn is-ghost', onclick: closeSheet }, ['Cancel']),
+    ]
+  );
+}
+
+/* ---------- starting sessions ---------------------------------------- */
+
+export function startLesson(lessonId) {
+  const lesson = LESSON_BY_ID.get(lessonId);
+  const prog = store.lessonProgress(lessonId);
+  const target = Math.min(MAX_LEVEL, prog.level + 1);
+  const spec = levelSpec(target - 1);
+  const s = store.settings();
+  beginSession({
+    pool: lesson.pool,
+    prompts: spec.prompts,
+    title: `${lesson.unitTitle} · ${lessonTitle(lesson)}`,
+    lessonId,
+    targetLevel: target,
+    timerSeconds: effectiveTimer(s.timerSeconds, target),
+    inputMode: s.inputMode,
+    promptStyle: s.promptStyle,
+  });
+}
+
+export function startReview() {
+  const due = duePositions();
+  const pool = due.length >= 3 ? due : seenPositions();
+  if (pool.length < 1) {
+    toast('Nothing to review yet — start the first lesson.', 'bad');
+    return;
+  }
+  const s = store.settings();
+  beginSession({
+    pool,
+    prompts: Math.min(24, Math.max(10, pool.length)),
+    title: 'Review · notes that are due',
+    timerSeconds: s.timerSeconds,
+    inputMode: s.inputMode,
+    promptStyle: s.promptStyle,
+  });
+}
+
+export function beginSession(config) {
+  if (config.inputMode === 'mic') {
+    const mode = store.settings().calibrateBeforeSession;
+    const stale = needsCalibration();
+    if (mode === 'always' || (mode === 'auto' && stale)) {
+      pendingStart = config;
+      renderCalibrate({ thenStart: true });
+      showScreen('calibrate');
+      return;
+    }
+    ensureEngine()
+      .then(() => runSession(config))
+      .catch((err) => {
+        toast(err.message, 'bad');
+        renderSetup();
+        showScreen('setup');
+      });
+    return;
+  }
+  runSession(config);
+}
+
+function needsCalibration() {
+  const c = store.calibration();
+  if (!c.gate || !c.at) return true;
+  const sixHours = 6 * 60 * 60 * 1000;
+  if (Date.now() - c.at > sixHours) return true;
+  if (engine.sampleRate && c.sampleRate && engine.sampleRate !== c.sampleRate) return true;
+  return false;
+}
+
+async function ensureEngine() {
+  if (!engine.running) {
+    setMicPlate('opening microphone…');
+    await engine.start();
+    setMicPlate('microphone live', true);
+  }
+  const c = store.calibration();
+  engine.setSensitivity(store.settings().detectionSensitivity);
+  engine.setGate(c.gate || undefined);
+  engine.setA4(store.settings().a4);
+  return engine;
+}
+
+/* ---------- calibration screen --------------------------------------- */
+
+export function renderCalibrate({ thenStart = false } = {}) {
+  const root = $('#screen-calibrate');
+  root.textContent = '';
+
+  const ring = h('div', { class: 'calib-ring' }, [h('span', { text: '3.0' })]);
+  const steps = h('div', { class: 'calib-steps' }, [h('i', { class: 'is-on' }), h('i'), h('i')]);
+  const levelStrip = h('div', { class: 'level-strip' }, Array.from({ length: 24 }, () => h('i')));
+  const status = h('p', { class: 'lede', style: 'margin-inline:auto', text: 'Put the guitar down, stay quiet, and let the room speak for three seconds. FretPro uses this to tell your playing apart from everything else.' });
+  const actions = h('div', { class: 'btn-row', style: 'justify-content:center;margin-top:20px' });
+
+  const panel = h('div', { class: 'calib panel' }, [
+    steps,
+    h('div', { class: 'eyebrow', text: 'Step 1 of 2 · room noise' }),
+    h('h1', { text: 'Listening to the room' }),
+    ring,
+    levelStrip,
+    status,
+    actions,
+  ]);
+  root.appendChild(panel);
+
+  const start = async () => {
+    actions.textContent = '';
+    try {
+      await ensureEngine();
+    } catch (err) {
+      status.textContent = err.message;
+      actions.appendChild(h('button', { class: 'btn', onclick: start }, ['Try again']));
+      actions.appendChild(h('button', { class: 'btn is-ghost', onclick: () => showScreen('path') }, ['Back']));
+      return;
+    }
+
+    engine.setGate(0.0001); // hear everything while measuring
+    const off = engine.onFrame((frame) => paintStrip(levelStrip, frame.rms * 6));
+    const result = await engine.calibrate(3000, (p) => {
+      ring.style.setProperty('--p', String(p * 100));
+      ring.querySelector('span').textContent = (3 - p * 3).toFixed(1);
+    });
+    off();
+    ring.style.setProperty('--p', '100');
+    ring.querySelector('span').textContent = '✓';
+
+    store.setCalibration({
+      noiseFloor: result.noiseFloor,
+      gate: result.gate,
+      sampleRate: result.sampleRate,
+    });
+    engine.setGate(result.gate);
+    renderCalibrateStep2(panel, result, thenStart);
+  };
+
+  actions.appendChild(h('button', { class: 'btn is-primary', onclick: start }, ['Start listening']));
+  actions.appendChild(
+    h('button', { class: 'btn is-ghost', onclick: () => (thenStart && pendingStart ? runSession(pendingStart) : showScreen('path')) }, [
+      thenStart ? 'Skip, use last calibration' : 'Back',
+    ])
+  );
+}
+
+function paintStrip(strip, level) {
+  const bars = strip.children;
+  const on = Math.round(clamp(level, 0, 1) * bars.length);
+  for (let i = 0; i < bars.length; i++) {
+    const b = bars[i];
+    b.className = i < on ? (i > bars.length * 0.85 ? 'is-peak' : i > bars.length * 0.6 ? 'is-hot' : 'is-on') : '';
+  }
+}
+
+function renderCalibrateStep2(panel, result, thenStart) {
+  panel.textContent = '';
+  const db = (v) => `${(20 * Math.log10(Math.max(v, 1e-9))).toFixed(1)} dB`;
+  const readout = h('div', { class: 'readout-big', text: '—' }, []);
+  const sub = h('small', { text: 'play any note' });
+  readout.appendChild(sub);
+  const levelStrip = h('div', { class: 'level-strip' }, Array.from({ length: 24 }, () => h('i')));
+  const guitarLine = h('div', { class: 'banner', style: 'text-align:left' }, [
+    h('b', { text: 'Threshold from the room only' }),
+    `Ignoring anything below ${db(result.gate)}. Play a few notes and this gets set properly.`,
+  ]);
+
+  // Measure how loud the guitar actually is, then put the threshold in the gap
+  // between it and the room. A floor-derived gate alone has no idea how much
+  // headroom your playing has, which is what lets stray sounds through.
+  let guitarPeak = 0;
+  let goodFrames = 0;
+  const floorDb = 20 * Math.log10(Math.max(result.noiseFloor, 1e-9));
+
+  function refineFromSignal() {
+    const signalDb = 20 * Math.log10(Math.max(guitarPeak, 1e-9));
+    const span = signalDb - floorDb;
+    if (span < 6) return false; // guitar is barely above the room; leave it alone
+    // Sit a third of the way up from the room toward the guitar, and always
+    // keep clear air on both sides.
+    const targetDb = Math.min(floorDb + Math.max(9, span * 0.35), signalDb - 6);
+    const gate = Math.pow(10, targetDb / 20);
+    store.setCalibration({ gate, noiseFloor: result.noiseFloor, signal: guitarPeak, sampleRate: result.sampleRate });
+    engine.setGate(gate);
+    guitarLine.className = 'banner is-good';
+    guitarLine.textContent = '';
+    guitarLine.append(
+      h('b', { text: `Guitar ${db(guitarPeak)} · room ${db(result.noiseFloor)}` }),
+      `${Math.round(span)} dB of headroom. Threshold set to ${db(gate)}, between the two.`
+    );
+    return true;
+  }
+
+  panel.append(
+    h('div', { class: 'calib-steps' }, [h('i', { class: 'is-on' }), h('i', { class: 'is-on' }), h('i')]),
+    h('div', { class: 'eyebrow', text: 'Step 2 of 2 · check the signal' }),
+    h('h1', { text: 'Play a note' }),
+    h('div', { class: `banner ${result.verdict.level === 'loud' ? 'is-bad' : result.verdict.level === 'quiet' ? 'is-good' : ''}` }, [
+      h('b', { text: `Room noise ${db(result.noiseFloor)}` }),
+      result.verdict.text,
+    ]),
+    readout,
+    levelStrip,
+    guitarLine,
+    h('p', { class: 'lede', style: 'margin-inline:auto', text: 'Play a few notes at your normal playing strength. The threshold gets set from the gap between your guitar and the room, which works far better than the room alone.' }),
+    h('div', { class: 'btn-row', style: 'justify-content:center;margin-top:20px' }, [
+      h(
+        'button',
+        {
+          class: 'btn is-primary',
+          onclick: () => {
+            if (off) off();
+            if (thenStart && pendingStart) runSession(pendingStart);
+            else {
+              renderSetup();
+              showScreen('setup');
+            }
+          },
+        },
+        [thenStart ? 'Start the session' : 'Done']
+      ),
+      h('button', { class: 'btn is-ghost', onclick: () => { if (off) off(); renderCalibrate({ thenStart }); } }, ['Redo calibration']),
+    ])
+  );
+
+  const off = engine.onFrame((frame) => {
+    paintStrip(levelStrip, frame.level);
+    if (frame.midi != null && frame.stable) {
+      readout.firstChild.textContent = noteName(frame.midi, store.settings().spelling);
+      sub.textContent = `${frame.freq.toFixed(1)} Hz · ${frame.cents > 0 ? '+' : ''}${frame.cents} cents`;
+      guitarPeak = Math.max(guitarPeak, frame.rms);
+      goodFrames += 1;
+      // Roughly a quarter-second of solid notes is enough to place the gate.
+      if (goodFrames === 15 || (goodFrames > 15 && goodFrames % 30 === 0)) refineFromSignal();
+    }
+  });
+}
+
+/* ---------- session screen ------------------------------------------- */
+
+function runSession(config) {
+  pendingStart = null;
+  const s = store.settings();
+  const root = $('#screen-session');
+  root.textContent = '';
+
+  const micMode = config.inputMode === 'mic';
+
+  const pips = h(
+    'div',
+    { class: 'pips' },
+    Array.from({ length: config.prompts }, () => h('i'))
+  );
+  const counter = h('div', { class: 'eyebrow' }, [h('b', { text: '0' }), ` / ${config.prompts}`]);
+
+  const verb = h('div', { class: 'ask-verb', text: 'get ready' });
+  const glyphSlot = h('div', {}, [h('div', { class: 'glyph', text: '·' })]);
+  const where = h('div', { class: 'ask-where' }, [h('b', { text: '' }), h('span', { text: '' })]);
+  const clock = h('div', { class: 'clock', text: config.timerSeconds ? config.timerSeconds.toFixed(1) : '∞' });
+  const clockBar = h('div', { class: 'clock-bar' }, [h('i', { style: 'width:100%' })]);
+  const verdict = h('div', { class: 'verdict', text: '' });
+
+  const needle = h('div', { class: 'meter-needle' });
+  const meterNote = h('b', { text: '—' });
+  const meterHz = h('b', { text: '0 Hz' });
+  const levelStrip = h('div', { class: 'level-strip' }, Array.from({ length: 28 }, () => h('i')));
+  const meter = h('div', { class: 'meter' }, [
+    h('div', { class: 'meter-scale' }, [h('div', { class: 'meter-ticks' }), h('div', { class: 'meter-center' }), needle]),
+    h('div', { class: 'meter-readout' }, [h('span', {}, ['heard ', meterNote]), h('span', {}, [meterHz])]),
+    levelStrip,
+  ]);
+
+  const stage = h('div', { class: 'stage' }, [
+    h('div', { class: 'ask' }, [
+      h('div', { class: 'ask-side ask-left' }, [where]),
+      h('div', { class: 'ask-side ask-center' }, [verb, glyphSlot]),
+      h('div', { class: 'ask-side ask-right' }, [h('div', { class: 'eyebrow', text: 'clock' }), clock, clockBar]),
+    ]),
+    verdict,
+    micMode ? meter : null,
+  ]);
+
+  const boardHost = h('div', { class: 'board-wrap' });
+  const choices = h('div', { class: 'choices' });
+  const hint = h('div', { class: 'hint-line', text: micMode ? 'Play the note on your guitar.' : 'Tap the fret on the board.' });
+
+  const quitBtn = h('button', { class: 'btn is-ghost', onclick: () => confirmQuit() }, ['Quit']);
+  const hearBtn = h('button', { class: 'btn is-ghost', onclick: () => playCurrentTone() }, ['Hear it']);
+  const revealBtn = h('button', { class: 'btn is-ghost', onclick: () => activeSession && activeSession.reveal() }, ['Show answer']);
+
+  root.append(
+    h('div', { class: 'session-top' }, [
+      h('div', {}, [h('div', { class: 'eyebrow', text: config.title }), counter]),
+      h('div', { class: 'spacer' }),
+      pips,
+    ]),
+    stage,
+    choices,
+    hint,
+    boardHost,
+    h('div', { class: 'session-foot' }, [hearBtn, revealBtn, h('div', { class: 'spacer' }), quitBtn])
+  );
+
+  // Board: show the working range for this pool, plus a little air around it.
+  const frets = config.pool.map((n) => n.fret);
+  const minFret = 0;
+  const maxFret = Math.min(MAX_FRET, Math.max(12, Math.max(...frets) + 1));
+  sessionBoard = createFretboard(boardHost, {
+    minFret,
+    maxFret,
+    tuning: s.tuning,
+    spelling: s.spelling,
+    flip: s.flipBoard,
+    interactive: !micMode,
+  });
+
+  showScreen('session');
+
+  const session = new Session(config, {
+    onCountIn: (n) => {
+      verb.textContent = n > 0 ? 'starting' : 'go';
+      glyphSlot.textContent = '';
+      glyphSlot.appendChild(h('div', { class: 'glyph', text: n > 0 ? String(n) : '·' }));
+    },
+    onPrompt: (prompt) => paintPrompt(prompt),
+    onTick: (secondsLeft, fraction) => {
+      if (secondsLeft == null) {
+        clock.textContent = '∞';
+        clockBar.firstChild.style.width = '100%';
+        return;
+      }
+      clock.textContent = secondsLeft.toFixed(1);
+      const low = fraction < 0.28;
+      clock.classList.toggle('is-low', low);
+      clockBar.classList.toggle('is-low', low);
+      clockBar.firstChild.style.width = pct(clamp(fraction, 0, 1));
+    },
+    onJudged: (info, sess) => paintJudgement(info, sess),
+    onEnd: (summary) => {
+      cleanupSession();
+      renderResults(summary, config);
+      showScreen('results');
+      renderRail();
+      renderPath();
+    },
+  });
+
+  activeSession = session;
+  session.attach(micMode ? engine : null);
+
+  if (micMode) {
+    meterUnsub = engine.onFrame((frame) => {
+      paintStrip(levelStrip, frame.level);
+      const cents = frame.midi != null ? clamp(frame.cents, -50, 50) : 0;
+      needle.style.left = `${50 + cents}%`;
+      needle.classList.toggle('is-intune', frame.midi != null && Math.abs(frame.cents) < 8);
+      if (frame.midi != null && frame.stable) {
+        meterNote.textContent = noteName(frame.midi, s.spelling);
+        meterHz.textContent = `${frame.freq.toFixed(1)} Hz`;
+      } else if (!frame.loud) {
+        meterNote.textContent = '—';
+        meterHz.textContent = 'quiet';
+      }
+    });
+  }
+
+  if (!micMode) {
+    sessionBoard.onTap(({ string, fret }) => {
+      if (!activeSession) return;
+      if (activeSession.prompt && activeSession.prompt.style === 'position') return; // answer with the buttons
+      activeSession.judge(midiAt(s.tuning, string, fret));
+    });
+  }
+
+  session.start();
+
+  /* --- painters ----------------------------------------------------- */
+
+  function paintPrompt(prompt) {
+    stage.className = 'stage';
+    verdict.textContent = '';
+    verdict.className = 'verdict';
+    counter.firstChild.textContent = String(prompt.number);
+    updatePips(session);
+    choices.textContent = '';
+    glyphSlot.textContent = '';
+
+    if (prompt.style === 'name') {
+      verb.textContent = micMode ? 'play this note' : 'tap this note';
+      glyphSlot.appendChild(glyphFor(prompt.name));
+      where.firstChild.textContent = `${['1st', '2nd', '3rd', '4th', '5th', '6th'][prompt.note.string - 1]}`;
+      where.lastChild.textContent = `string · ${shortName(prompt.note.string, 0)}`;
+      sessionBoard.setMarkers([]);
+      hint.textContent = micMode
+        ? `Find ${prompt.name} on the ${prompt.note.string}${ordinalSuffix(prompt.note.string)} string and play it.`
+        : `Tap ${prompt.name} on the ${prompt.note.string}${ordinalSuffix(prompt.note.string)} string.`;
+    } else {
+      verb.textContent = micMode ? 'play the marked note' : 'name the marked note';
+      glyphSlot.appendChild(h('div', { class: 'glyph', text: '?' }));
+      where.firstChild.textContent = `${['1st', '2nd', '3rd', '4th', '5th', '6th'][prompt.note.string - 1]}`;
+      where.lastChild.textContent = `string · fret ${prompt.note.fret}`;
+      sessionBoard.setMarkers([{ ...prompt.note, kind: 'target', pulse: true }]);
+      hint.textContent = micMode ? 'Play the highlighted position.' : 'Which note is this?';
+      if (!micMode) buildChoices(prompt);
+    }
+  }
+
+  function buildChoices(prompt) {
+    const pcs = poolPitchClasses(config.pool);
+    const options = new Set([prompt.pc]);
+    const shuffled = pcs.filter((p) => p !== prompt.pc).sort(() => Math.random() - 0.5);
+    for (const p of shuffled) {
+      if (options.size >= Math.min(6, pcs.length)) break;
+      options.add(p);
+    }
+    const list = [...options].sort(() => Math.random() - 0.5);
+    for (const pc of list) {
+      const midi = nearestMidiWithPc(pc, prompt.midi);
+      const label = noteName(midi, s.spelling);
+      const btn = h('button', { class: 'choice', text: label, onclick: () => {
+        if (!activeSession || activeSession.state === 'correct') return;
+        btn.classList.add(pc === prompt.pc ? 'is-right' : 'is-wrong');
+        activeSession.judge(midi);
+      } });
+      choices.appendChild(btn);
+    }
+  }
+
+  function paintJudgement(info, sess) {
+    const prompt = sess.prompt;
+    if (info.verdict === 'correct') {
+      stage.className = 'stage is-correct';
+      const g = glyphSlot.firstChild;
+      if (g) g.classList.add('is-correct');
+      if (prompt.style === 'position') {
+        glyphSlot.textContent = '';
+        const el = glyphFor(prompt.name);
+        el.classList.add('is-correct');
+        glyphSlot.appendChild(el);
+      }
+      sessionBoard.setMarkers([{ ...prompt.note, kind: 'correct', label: shortName(prompt.note.string, prompt.note.fret) }]);
+      const secs = (info.ms / 1000).toFixed(1);
+      verdict.className = 'verdict is-correct';
+      const drift =
+        micMode && Math.abs(info.offCents || 0) >= 35
+          ? ` · ${Math.abs(info.offCents)} cents ${info.offCents > 0 ? 'sharp' : 'flat'}, worth a tune`
+          : '';
+      verdict.textContent = info.firstTry
+        ? `Right — ${secs}s${info.octaveNote ? ` (an octave ${info.octaveNote}, but the right note)` : ''}${drift}`
+        : `Got it — ${secs}s after ${info.attempts || sess.wrongThisPrompt.length} miss${(sess.wrongThisPrompt.length || 1) > 1 ? 'es' : ''}${drift}`;
+    } else if (info.verdict === 'wrong') {
+      stage.className = 'stage is-wrong';
+      verdict.className = 'verdict is-wrong';
+      verdict.textContent = `That was ${info.playedName}${info.playedOctave != null ? info.playedOctave : ''} — try again.`;
+      setTimeout(() => {
+        if (sess.state === 'awaiting') stage.className = 'stage';
+      }, 420);
+    } else if (info.verdict === 'timeout') {
+      stage.className = 'stage is-revealed';
+      verdict.className = 'verdict is-wrong';
+      verdict.textContent = `Time — it was ${prompt.name} at fret ${prompt.note.fret}.`;
+      if (prompt.style === 'position') {
+        glyphSlot.textContent = '';
+        glyphSlot.appendChild(glyphFor(prompt.name));
+      }
+      sessionBoard.setMarkers([{ ...prompt.note, kind: 'wrong', label: shortName(prompt.note.string, prompt.note.fret) }]);
+      if (store.settings().sound) playNoteTone(prompt.midi, s.a4, 700);
+    }
+    updatePips(sess);
+  }
+
+  function updatePips(sess) {
+    const kids = pips.children;
+    for (let i = 0; i < kids.length; i++) {
+      const r = sess.results[i];
+      kids[i].className = r ? (r.correct ? 'is-ok' : 'is-bad') : i === sess.results.length ? 'is-now' : '';
+    }
+  }
+
+  function playCurrentTone() {
+    if (activeSession && activeSession.prompt) playNoteTone(activeSession.prompt.midi, s.a4, 900);
+  }
+
+  function ordinalSuffix(n) {
+    return n === 1 ? 'st' : n === 2 ? 'nd' : n === 3 ? 'rd' : 'th';
+  }
+}
+
+function nearestMidiWithPc(pc, referenceMidi) {
+  const base = referenceMidi - (((referenceMidi % 12) - pc + 12) % 12);
+  const options = [base, base + 12, base - 12];
+  return options.reduce((best, m) => (Math.abs(m - referenceMidi) < Math.abs(best - referenceMidi) ? m : best), base);
+}
+
+function confirmQuit() {
+  openSheet('Leave this session?', ['Answers so far are already saved against each note, but the session will not count toward the level.'], [
+    h('button', { class: 'btn is-danger', onclick: () => { closeSheet(); cleanupSession(); renderPath(); renderRail(); showScreen('path'); } }, ['Leave']),
+    h('button', { class: 'btn is-ghost', onclick: closeSheet }, ['Keep going']),
+  ]);
+}
+
+function cleanupSession() {
+  if (activeSession) activeSession.stop();
+  activeSession = null;
+  if (meterUnsub) meterUnsub();
+  meterUnsub = null;
+}
+
+/* ---------- results --------------------------------------------------- */
+
+function renderResults(summary, config) {
+  const root = $('#screen-results');
+  root.textContent = '';
+  const s = store.settings();
+  const passed = summary.requiredAccuracy == null || summary.accuracy >= summary.requiredAccuracy;
+
+  if (summary.leveledTo && s.sound) playLevelUp();
+
+  const lesson = summary.lessonId ? LESSON_BY_ID.get(summary.lessonId) : null;
+  const nextLesson = lesson ? LESSONS[lesson.index + 1] : null;
+
+  root.appendChild(
+    h('div', {}, [
+      h('div', { class: 'eyebrow', text: summary.title }),
+      h('h1', { text: summary.leveledTo ? `Level ${summary.leveledTo} cleared` : passed ? 'Session complete' : 'Not quite yet' }),
+    ])
+  );
+
+  root.appendChild(
+    h('div', { class: 'result-grid' }, [
+      h('div', { class: `tile ${summary.accuracy >= 0.9 ? 'is-good' : summary.accuracy < 0.6 ? 'is-bad' : ''}` }, [
+        h('span', { text: 'First-try accuracy' }),
+        h('b', { text: pct(summary.accuracy) }),
+        h('small', { text: `${summary.correct} of ${summary.prompts}` }),
+      ]),
+      h('div', { class: 'tile' }, [
+        h('span', { text: 'Average time' }),
+        h('b', { text: summary.avgMs ? `${(summary.avgMs / 1000).toFixed(1)}s` : '—' }),
+        h('small', { text: 'on correct answers' }),
+      ]),
+      h('div', { class: 'tile is-accent' }, [h('span', { text: 'XP earned' }), h('b', { text: `+${summary.xp}` })]),
+      h('div', { class: 'tile' }, [
+        h('span', { text: 'Pool mastery' }),
+        h('b', { text: pct(summary.mastery) }),
+        h('small', { text: 'these notes' }),
+      ]),
+    ])
+  );
+
+  if (summary.requiredAccuracy != null) {
+    root.appendChild(
+      h('div', { class: `banner ${summary.leveledTo ? 'is-good' : passed ? '' : 'is-bad'}` }, [
+        h('b', { text: summary.leveledTo ? `Unlocked level ${summary.leveledTo}` : passed ? 'Level held' : `Needed ${pct(summary.requiredAccuracy)} to level up` }),
+        summary.leveledTo
+          ? nextLesson
+            ? `Next stop: ${lessonTitle(nextLesson)}.`
+            : 'That is the end of the path — keep reviewing to hold it.'
+          : passed
+          ? 'Run it again to push the level higher.'
+          : 'Run it again — the notes you missed will come up more often.',
+      ])
+    );
+  }
+
+  if (summary.trouble.length) {
+    root.appendChild(h('div', { class: 'eyebrow', style: 'margin-top:18px', text: 'Notes that fought back' }));
+    root.appendChild(
+      h(
+        'div',
+        { class: 'badge-row' },
+        summary.trouble.map((t) => noteBadge(s.tuning, t.note.string, t.note.fret, s.spelling))
+      )
+    );
+  }
+
+  root.appendChild(
+    h('div', { class: 'btn-row', style: 'margin-top:24px' }, [
+      h('button', { class: 'btn is-primary', onclick: () => beginSession({ ...config }) }, ['Run it again']),
+      nextLesson && summary.leveledTo && lessonState(nextLesson) !== 'locked'
+        ? h('button', { class: 'btn', onclick: () => startLesson(nextLesson.id) }, ['Next lesson'])
+        : null,
+      h('button', { class: 'btn is-ghost', onclick: () => { renderPath(); showScreen('path'); } }, ['Back to path']),
+    ])
+  );
+}
+
+/* ---------- progress screen ------------------------------------------ */
+
+export function renderProgress() {
+  const root = $('#screen-progress');
+  root.textContent = '';
+  const s = store.settings();
+  const st = store.stats();
+  const lvl = store.levelFromXp(st.xp);
+  const overall = overallMastery();
+  const mastered = ALL_POSITIONS.filter((n) => masteryFor(n.string, n.fret) >= 0.85).length;
+  const seen = seenPositions().length;
+  const lifetimeAcc = st.prompts ? st.correct / st.prompts : 0;
+
+  root.append(
+    h('div', { class: 'eyebrow', text: 'Where you actually are' }),
+    h('h1', { text: 'Progress' }),
+    h('div', { class: 'result-grid' }, [
+      h('div', { class: 'tile is-accent' }, [
+        h('span', { text: 'Fretboard mastered' }),
+        h('b', { text: pct(overall) }),
+        h('small', { text: `${mastered} of ${ALL_POSITIONS.length} positions solid` }),
+      ]),
+      h('div', { class: 'tile' }, [h('span', { text: 'Notes met' }), h('b', { text: String(seen) }), h('small', { text: 'seen at least once' })]),
+      h('div', { class: 'tile' }, [
+        h('span', { text: 'Lifetime accuracy' }),
+        h('b', { text: pct(lifetimeAcc) }),
+        h('small', { text: `${st.prompts} prompts` }),
+      ]),
+      h('div', { class: 'tile' }, [
+        h('span', { text: 'Level' }),
+        h('b', { text: `L${lvl.level}` }),
+        h('small', { text: `${lvl.into}/${lvl.need} XP` }),
+      ]),
+      h('div', { class: 'tile' }, [
+        h('span', { text: 'Streak' }),
+        h('b', { text: String(store.currentStreak()) }),
+        h('small', { text: `best ${st.longestStreak}` }),
+      ]),
+      h('div', { class: 'tile' }, [h('span', { text: 'Sessions' }), h('b', { text: String(st.sessions) })]),
+    ])
+  );
+
+  const boardHost = h('div', { class: 'board-wrap' });
+  const heatPanel = h('div', { class: 'panel', style: 'margin-top:22px' }, [
+    h('div', { class: 'eyebrow', text: 'Every position, coloured by how well you know it' }),
+    boardHost,
+  ]);
+  root.appendChild(heatPanel);
+
+  progressBoard = createFretboard(boardHost, {
+    minFret: 0,
+    maxFret: MAX_FRET,
+    tuning: s.tuning,
+    spelling: s.spelling,
+    flip: s.flipBoard,
+    interactive: false,
+  });
+
+  const heat = {};
+  for (const n of ALL_POSITIONS) heat[posKey(n.string, n.fret)] = masteryFor(n.string, n.fret);
+  progressBoard.setHeatmap(heat);
+
+  heatPanel.appendChild(
+    h('div', { class: 'mastery-legend' }, [
+      h('span', { class: 'legend-swatch' }, [h('i', { style: `background:${progressBoard.heatColor(0)}` }), 'not met']),
+      h('span', { class: 'legend-swatch' }, [h('i', { style: `background:${progressBoard.heatColor(0.35)}` }), 'learning']),
+      h('span', { class: 'legend-swatch' }, [h('i', { style: `background:${progressBoard.heatColor(0.7)}` }), 'getting there']),
+      h('span', { class: 'legend-swatch' }, [h('i', { style: `background:${progressBoard.heatColor(1)}` }), 'mastered']),
+    ])
+  );
+
+  // Per-string mastery
+  const bars = h('div', { class: 'bars' });
+  for (let str = 6; str >= 1; str--) {
+    const positions = ALL_POSITIONS.filter((n) => n.string === str);
+    const value = positions.reduce((a, n) => a + masteryFor(n.string, n.fret), 0) / Math.max(1, positions.length);
+    bars.appendChild(
+      h('div', { class: 'bar-row' }, [
+        h('span', { text: `${str} · ${shortName(str, 0)}` }),
+        h('div', { class: 'bar-track' }, [h('i', { style: `width:${pct(value)}` })]),
+        h('em', { text: pct(value) }),
+      ])
+    );
+  }
+  root.appendChild(h('div', { class: 'panel', style: 'margin-top:22px' }, [h('div', { class: 'eyebrow', text: 'Mastery by string' }), bars]));
+
+  // Weakest notes
+  const weak = seenPositions()
+    .map((n) => ({ n, m: masteryFor(n.string, n.fret), rec: store.noteRecord(posKey(n.string, n.fret)) }))
+    .filter((x) => x.rec && x.rec.reps >= 2)
+    .sort((a, b) => a.m - b.m)
+    .slice(0, 10);
+
+  if (weak.length) {
+    root.appendChild(
+      h('div', { class: 'panel', style: 'margin-top:22px' }, [
+        h('div', { class: 'eyebrow', text: 'Weakest notes right now' }),
+        h(
+          'div',
+          { class: 'badge-row' },
+          weak.map((x) => noteBadge(s.tuning, x.n.string, x.n.fret, s.spelling))
+        ),
+        h('div', { class: 'btn-row', style: 'margin-top:16px' }, [
+          h(
+            'button',
+            {
+              class: 'btn',
+              onclick: () =>
+                beginSession({
+                  pool: weak.map((x) => x.n),
+                  prompts: 15,
+                  title: 'Drill · weakest notes',
+                  timerSeconds: s.timerSeconds,
+                  inputMode: s.inputMode,
+                  promptStyle: s.promptStyle,
+                }),
+            },
+            ['Drill these 10']
+          ),
+        ]),
+      ])
+    );
+  }
+
+  // History
+  if (st.history.length) {
+    const list = h('div', { class: 'history' });
+    for (const entry of st.history.slice(0, 12)) {
+      list.appendChild(
+        h('div', { class: 'history-row' }, [
+          h('b', { text: entry.title }),
+          h('em', { text: pct(entry.accuracy) }),
+          h('em', { text: entry.avgMs ? `${(entry.avgMs / 1000).toFixed(1)}s` : '—' }),
+          h('em', { text: new Date(entry.at).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) }),
+        ])
+      );
+    }
+    root.appendChild(h('div', { class: 'panel', style: 'margin-top:22px' }, [h('div', { class: 'eyebrow', text: 'Recent sessions' }), list]));
+  }
+}
+
+/* ---------- drill screen ---------------------------------------------- */
+
+export function renderDrill() {
+  const root = $('#screen-drill');
+  root.textContent = '';
+  const s = store.settings();
+
+  root.append(
+    h('div', { class: 'eyebrow', text: 'Practice outside the path' }),
+    h('h1', { text: 'Drills' }),
+    h('p', { class: 'lede', text: 'Free practice. Nothing here unlocks lessons, but every answer still feeds the same spaced-repetition schedule.' })
+  );
+
+  const due = duePositions();
+  const seen = seenPositions();
+
+  const quick = h('div', { class: 'result-grid' }, [
+    drillCard('Review', `${due.length} due`, 'Notes the schedule says are ready to come back.', () => startReview(), due.length === 0),
+    drillCard('Everything met', `${seen.length} notes`, 'Every position you have seen at least once.', () =>
+      beginSession({
+        pool: seen,
+        prompts: 20,
+        title: 'Drill · everything met',
+        timerSeconds: s.timerSeconds,
+        inputMode: s.inputMode,
+        promptStyle: s.promptStyle,
+      }), seen.length === 0),
+    drillCard('Speed run', '3s clock', 'Same notes, tighter clock. Good for the last mile.', () =>
+      beginSession({
+        pool: seen.length ? seen : ALL_POSITIONS.filter((n) => n.string === 6),
+        prompts: 20,
+        title: 'Drill · speed run',
+        timerSeconds: 3,
+        inputMode: s.inputMode,
+        promptStyle: s.promptStyle,
+      })),
+  ]);
+  root.appendChild(quick);
+
+  // Custom drill builder
+  const stringBoxes = h(
+    'div',
+    { class: 'checkgrid' },
+    [6, 5, 4, 3, 2, 1].map((n) =>
+      h('label', {}, [
+        h('input', { type: 'checkbox', value: String(n), checked: true, class: 'drill-string' }),
+        `${n} · ${shortName(n, 0)}`,
+      ])
+    )
+  );
+
+  const minFret = h('input', { type: 'number', min: '0', max: String(MAX_FRET), value: '0', style: 'max-width:100px' });
+  const maxFret = h('input', { type: 'number', min: '0', max: String(MAX_FRET), value: '12', style: 'max-width:100px' });
+  const naturalsOnly = h('input', { type: 'checkbox', checked: true });
+  const promptCount = h('input', { type: 'number', min: '5', max: '60', value: '20', style: 'max-width:100px' });
+
+  root.appendChild(
+    h('div', { class: 'panel', style: 'margin-top:22px' }, [
+      h('div', { class: 'eyebrow', text: 'Build your own' }),
+      h('h2', { text: 'Custom drill', style: 'margin:6px 0 16px' }),
+      h('div', { class: 'cols' }, [
+        h('div', {}, [
+          h('div', { class: 'field' }, [h('label', { text: 'Strings' }), stringBoxes]),
+          h('div', { class: 'field' }, [
+            h('label', { text: 'Fret range' }),
+            h('div', { style: 'display:flex;gap:10px;align-items:center' }, [minFret, h('span', { text: 'to' }), maxFret]),
+          ]),
+        ]),
+        h('div', {}, [
+          h('div', { class: 'field' }, [
+            h('label', { text: 'Note set' }),
+            h('label', { class: 'switch' }, [naturalsOnly, 'Natural notes only (no sharps or flats)']),
+          ]),
+          h('div', { class: 'field' }, [h('label', { text: 'Prompts' }), promptCount]),
+        ]),
+      ]),
+      h('div', { class: 'btn-row' }, [
+        h(
+          'button',
+          {
+            class: 'btn is-primary',
+            onclick: () => {
+              const strings = [...root.querySelectorAll('.drill-string')].filter((b) => b.checked).map((b) => Number(b.value));
+              const lo = clamp(Number(minFret.value) || 0, 0, MAX_FRET);
+              const hi = clamp(Number(maxFret.value) || 12, lo, MAX_FRET);
+              const pool = [];
+              for (const str of strings) {
+                for (let f = lo; f <= hi; f++) {
+                  if (naturalsOnly.checked && !isNatural(midiAt(s.tuning, str, f))) continue;
+                  pool.push({ string: str, fret: f });
+                }
+              }
+              if (pool.length < 2) {
+                toast('That leaves fewer than two notes — widen the range.', 'bad');
+                return;
+              }
+              beginSession({
+                pool,
+                prompts: clamp(Number(promptCount.value) || 20, 5, 60),
+                title: `Drill · ${strings.length} string${strings.length > 1 ? 's' : ''}, frets ${lo}–${hi}`,
+                timerSeconds: s.timerSeconds,
+                inputMode: s.inputMode,
+                promptStyle: s.promptStyle,
+              });
+            },
+          },
+          ['Start drill']
+        ),
+      ]),
+    ])
+  );
+}
+
+function drillCard(title, stat, blurb, onclick, disabled = false) {
+  return h('div', { class: 'tile' }, [
+    h('span', { text: title }),
+    h('b', { text: stat }),
+    h('small', { text: blurb, style: 'margin:6px 0 12px' }),
+    h('button', { class: 'btn is-ghost', onclick, disabled, style: 'width:100%' }, ['Start']),
+  ]);
+}
+
+/* ---------- setup screen ---------------------------------------------- */
+
+export function renderSetup() {
+  const root = $('#screen-setup');
+  root.textContent = '';
+  const s = store.settings();
+  const c = store.calibration();
+
+  root.append(h('div', { class: 'eyebrow', text: 'Signal and preferences' }), h('h1', { text: 'Setup' }));
+
+  /* --- microphone panel --- */
+  const micStatus = h('p', {
+    class: 'lede',
+    text: engine.running ? 'Microphone is live.' : 'Microphone is closed. It opens when a session starts.',
+  });
+  const calibLine = h('p', {
+    class: 'help',
+    text: c.gate
+      ? `Last calibrated ${new Date(c.at).toLocaleString()} · gate at ${(20 * Math.log10(c.gate)).toFixed(1)} dB`
+      : 'Not calibrated yet.',
+  });
+
+  const tunerNote = h('div', { class: 'readout-big', text: '—' });
+  const tunerSub = h('small', { text: 'open the tuner and play' });
+  tunerNote.appendChild(tunerSub);
+  const tunerNeedle = h('div', { class: 'meter-needle' });
+  const tunerStrip = h('div', { class: 'level-strip' }, Array.from({ length: 28 }, () => h('i')));
+  const tunerMeter = h('div', { class: 'meter' }, [
+    h('div', { class: 'meter-scale' }, [h('div', { class: 'meter-ticks' }), h('div', { class: 'meter-center' }), tunerNeedle]),
+    tunerStrip,
+  ]);
+  let tunerOff = null;
+
+  const tunerBtn = h('button', { class: 'btn' }, ['Open tuner']);
+  tunerBtn.addEventListener('click', async () => {
+    if (tunerOff) {
+      tunerOff();
+      tunerOff = null;
+      tunerBtn.textContent = 'Open tuner';
+      tunerNote.firstChild.textContent = '—';
+      tunerSub.textContent = 'tuner closed';
+      return;
+    }
+    try {
+      await ensureEngine();
+    } catch (err) {
+      toast(err.message, 'bad');
+      return;
+    }
+    tunerBtn.textContent = 'Close tuner';
+    tunerOff = engine.onFrame((frame) => {
+      paintStrip(tunerStrip, frame.level);
+      const cents = frame.midi != null ? clamp(frame.cents, -50, 50) : 0;
+      tunerNeedle.style.left = `${50 + cents}%`;
+      tunerNeedle.classList.toggle('is-intune', frame.midi != null && Math.abs(frame.cents) < 5);
+      if (frame.midi != null && frame.stable) {
+        tunerNote.firstChild.textContent = noteName(frame.midi, s.spelling);
+        tunerSub.textContent = `${frame.freq.toFixed(1)} Hz · ${frame.cents > 0 ? '+' : ''}${frame.cents} cents`;
+      }
+    });
+  });
+
+  root.appendChild(
+    h('div', { class: 'panel', style: 'margin-top:18px' }, [
+      h('div', { class: 'eyebrow', text: 'Microphone' }),
+      h('h2', { text: 'Signal', style: 'margin:6px 0 10px' }),
+      micStatus,
+      calibLine,
+      tunerMeter,
+      tunerNote,
+      h('div', { class: 'btn-row', style: 'margin-top:16px' }, [
+        h('button', { class: 'btn is-primary', onclick: () => { if (tunerOff) { tunerOff(); tunerOff = null; } renderCalibrate({ thenStart: false }); showScreen('calibrate'); } }, ['Calibrate room noise']),
+        tunerBtn,
+      ]),
+    ])
+  );
+
+  /* --- practice settings --- */
+  const timerValue = h('b', { text: s.timerSeconds ? `${s.timerSeconds}s` : 'no clock' , style: 'font-family:var(--font-mono)'});
+  const timerInput = h('input', {
+    type: 'range',
+    min: '0',
+    max: '20',
+    step: '0.5',
+    value: String(s.timerSeconds),
+    oninput: (e) => {
+      const v = Number(e.target.value);
+      store.setSetting('timerSeconds', v);
+      timerValue.textContent = v ? `${v}s` : 'no clock';
+    },
+  });
+
+  const toleranceValue = h('b', { text: `±${s.pitchTolerance} cents`, style: 'font-family:var(--font-mono)' });
+  const toleranceInput = h('input', {
+    type: 'range',
+    min: '20',
+    max: '85',
+    step: '5',
+    value: String(s.pitchTolerance),
+    oninput: (e) => {
+      const v = Number(e.target.value);
+      store.setSetting('pitchTolerance', v);
+      toleranceValue.textContent = `±${v} cents`;
+      const help = document.getElementById('toleranceHelp');
+      if (help) help.textContent = toleranceHelpText(v);
+    },
+  });
+
+  const panel = h('div', { class: 'panel', style: 'margin-top:22px' }, [
+    h('div', { class: 'eyebrow', text: 'Practice' }),
+    h('h2', { text: 'How sessions run', style: 'margin:6px 0 18px' }),
+    h('div', { class: 'cols' }, [
+      h('div', {}, [
+        h('div', { class: 'field' }, [
+          h('label', {}, ['Time per note · ', timerValue]),
+          timerInput,
+          h('div', { class: 'help', text: 'How long you get to find and play each note. Slide to zero to remove the clock entirely.' }),
+        ]),
+        segField('Input', s.inputMode, [['mic', 'Guitar (mic)'], ['tap', 'Tap the board']], (v) => store.setSetting('inputMode', v)),
+        segField('Prompt', s.promptStyle, [['name', 'Note name'], ['position', 'Marked fret'], ['mixed', 'Mixed']], (v) =>
+          store.setSetting('promptStyle', v)
+        ),
+        h('div', { class: 'field' }, [
+          h('label', { class: 'switch' }, [
+            checkbox(s.lessonsTightenTimer, (v) => store.setSetting('lessonsTightenTimer', v)),
+            'Higher levels tighten the clock',
+          ]),
+          h('div', { class: 'help', text: 'Level 2 runs at 80% of your time, level 3 at 65%.' }),
+        ]),
+      ]),
+      h('div', {}, [
+        segField('Note spelling', s.spelling, [['sharps', 'Sharps'], ['flats', 'Flats'], ['both', 'Both']], (v) => {
+          store.setSetting('spelling', v);
+          renderSetup();
+        }),
+        segField(
+          'Right note, wrong octave',
+          s.octaveStrictness,
+          [['lenient', 'Counts as correct'], ['strict', 'Must be exact']],
+          (v) => store.setSetting('octaveStrictness', v)
+        ),
+        h('div', { class: 'field' }, [
+          h('label', {}, ['How far off still counts · ', toleranceValue]),
+          toleranceInput,
+          h('div', { class: 'help', id: 'toleranceHelp', text: toleranceHelpText(s.pitchTolerance) }),
+        ]),
+        h('div', { class: 'field' }, [
+          h('label', { text: 'What counts as a played note' }),
+          h(
+            'div',
+            { class: 'seg' },
+            Object.entries(SENSITIVITY).map(([key, preset]) =>
+              h('button', {
+                type: 'button',
+                class: s.detectionSensitivity === key ? 'is-on' : '',
+                text: preset.label,
+                onclick: (e) => {
+                  e.currentTarget.parentElement.querySelectorAll('button').forEach((b) => b.classList.remove('is-on'));
+                  e.currentTarget.classList.add('is-on');
+                  store.setSetting('detectionSensitivity', key);
+                  engine.setSensitivity(key);
+                  const help = document.getElementById('sensitivityHelp');
+                  if (help) help.textContent = sensitivityHelpText(key);
+                },
+              })
+            )
+          ),
+          h('div', { class: 'help', id: 'sensitivityHelp', text: sensitivityHelpText(s.detectionSensitivity) }),
+        ]),
+        segField('Calibrate before sessions', s.calibrateBeforeSession, [['auto', 'When stale'], ['always', 'Every time'], ['never', 'Never']], (v) =>
+          store.setSetting('calibrateBeforeSession', v)
+        ),
+        h('div', { class: 'field' }, [
+          h('label', { text: 'Tuning' }),
+          select(
+            Object.entries(TUNINGS).map(([k, v]) => [k, v.label]),
+            s.tuning,
+            (v) => {
+              store.setSetting('tuning', v);
+              renderSetup();
+              renderPath();
+            }
+          ),
+          h('div', { class: 'help', text: 'Everything follows the tuning you pick. The path itself was laid out for standard tuning, so in an alternate tuning a lesson may include a sharp where a natural used to be.' }),
+        ]),
+        h('div', { class: 'field' }, [
+          h('label', { class: 'switch' }, [checkbox(s.countIn, (v) => store.setSetting('countIn', v)), 'Count in before the first note']),
+          h('label', { class: 'switch' }, [checkbox(s.sound, (v) => store.setSetting('sound', v)), 'Sound feedback']),
+          h('label', { class: 'switch' }, [
+            checkbox(s.flipBoard, (v) => {
+              store.setSetting('flipBoard', v);
+              renderSetup();
+            }),
+            'Flip the board (low E on top)',
+          ]),
+        ]),
+        h('div', { class: 'field' }, [
+          h('label', { text: 'Daily goal (sessions)' }),
+          h('input', {
+            type: 'number',
+            min: '1',
+            max: '20',
+            value: String(s.dailyGoal),
+            style: 'max-width:110px',
+            onchange: (e) => store.setSetting('dailyGoal', clamp(Number(e.target.value) || 1, 1, 20)),
+          }),
+        ]),
+        h('div', { class: 'field' }, [
+          h('label', { text: 'Reference pitch (A4)' }),
+          h('input', {
+            type: 'number',
+            min: '415',
+            max: '466',
+            value: String(s.a4),
+            style: 'max-width:110px',
+            onchange: (e) => {
+              const v = clamp(Number(e.target.value) || 440, 415, 466);
+              store.setSetting('a4', v);
+              engine.setA4(v);
+            },
+          }),
+        ]),
+      ]),
+    ]),
+  ]);
+  root.appendChild(panel);
+
+  /* --- data --- */
+  root.appendChild(
+    h('div', { class: 'panel', style: 'margin-top:22px' }, [
+      h('div', { class: 'eyebrow', text: 'Data' }),
+      h('h2', { text: 'Your progress lives in this browser', style: 'margin:6px 0 10px' }),
+      h('p', { class: 'help', text: 'Nothing is uploaded anywhere. Export a backup before clearing site data.' }),
+      h('div', { class: 'btn-row', style: 'margin-top:14px' }, [
+        h('button', { class: 'btn is-ghost', onclick: exportProgress }, ['Export backup']),
+        h('button', { class: 'btn is-ghost', onclick: importProgress }, ['Import backup']),
+        h('button', { class: 'btn is-danger', onclick: confirmReset }, ['Reset everything']),
+      ]),
+    ])
+  );
+}
+
+/** The neighbouring fret is 100 cents away, so what is left is the margin. */
+function toleranceHelpText(cents) {
+  const margin = 100 - cents;
+  const flavour =
+    cents <= 35
+      ? 'Tight — your guitar needs to be well in tune.'
+      : cents <= 55
+      ? 'Normal.'
+      : cents <= 75
+      ? 'Forgiving of a guitar that has drifted a little.'
+      : 'Very forgiving. Bends and heavy fretting still pass.';
+  return `${flavour} A note this far off the target still counts, leaving ${margin} cents of margin before the next fret would be accepted too.`;
+}
+
+function sensitivityHelpText(key) {
+  const preset = SENSITIVITY[key] || SENSITIVITY.normal;
+  const hold = Math.round((preset.stableFrames / 60) * 1000);
+  const base =
+    key === 'strict'
+      ? 'Only clean, well-sustained notes register. Use this if stray sounds are answering for you.'
+      : key === 'relaxed'
+      ? 'Picks up light or short notes, and more of everything else with them.'
+      : 'A good default for a laptop microphone in a normal room.';
+  return `${base} A sound must hold a steady pitch for about ${hold}ms to count.`;
+}
+
+function segField(label, value, options, onChange) {
+  const seg = h(
+    'div',
+    { class: 'seg' },
+    options.map(([val, text]) =>
+      h('button', {
+        type: 'button',
+        class: value === val ? 'is-on' : '',
+        text,
+        onclick: (e) => {
+          seg.querySelectorAll('button').forEach((b) => b.classList.remove('is-on'));
+          e.currentTarget.classList.add('is-on');
+          onChange(val);
+        },
+      })
+    )
+  );
+  return h('div', { class: 'field' }, [h('label', { text: label }), seg]);
+}
+
+function checkbox(checked, onChange) {
+  return h('input', { type: 'checkbox', checked, onchange: (e) => onChange(e.target.checked) });
+}
+
+function select(options, value, onChange) {
+  return h(
+    'select',
+    { onchange: (e) => onChange(e.target.value) },
+    options.map(([val, text]) => h('option', { value: val, selected: val === value, text }))
+  );
+}
+
+function exportProgress() {
+  const blob = new Blob([store.exportJson()], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = h('a', { href: url, download: `fretpro-backup-${store.todayKey()}.json` });
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+  toast('Backup downloaded.', 'good');
+}
+
+function importProgress() {
+  const input = h('input', { type: 'file', accept: 'application/json', style: 'display:none' });
+  input.addEventListener('change', async () => {
+    const file = input.files && input.files[0];
+    if (!file) return;
+    try {
+      store.importJson(await file.text());
+      toast('Progress restored.', 'good');
+      renderAll();
+    } catch (err) {
+      toast(err.message, 'bad');
+    }
+  });
+  document.body.appendChild(input);
+  input.click();
+  input.remove();
+}
+
+function confirmReset() {
+  openSheet(
+    'Reset everything?',
+    ['Every level, streak and note record is deleted. This cannot be undone — export a backup first if you want one.'],
+    [
+      h('button', { class: 'btn is-danger', onclick: () => { store.resetAll(); closeSheet(); renderAll(); showScreen('path'); toast('Progress cleared.', ''); } }, ['Delete it all']),
+      h('button', { class: 'btn is-ghost', onclick: closeSheet }, ['Cancel']),
+    ]
+  );
+}
+
+/* ---------- boot ------------------------------------------------------- */
+
+export function renderAll() {
+  renderRail();
+  renderPath();
+  renderDrill();
+  renderProgress();
+  renderSetup();
+}
+
+export function boot() {
+  renderAll();
+  showScreen('path');
+
+  document.querySelectorAll('.navbtn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const target = btn.dataset.screen;
+      if (activeSession) {
+        confirmQuit();
+        return;
+      }
+      if (target === 'progress') renderProgress();
+      if (target === 'drill') renderDrill();
+      if (target === 'setup') renderSetup();
+      if (target === 'path') renderPath();
+      showScreen(target);
+    });
+  });
+
+  document.querySelectorAll('[data-close-sheet]').forEach((el) => el.addEventListener('click', closeSheet));
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      if (!$('#sheet').hidden) closeSheet();
+      else if (activeSession) confirmQuit();
+    }
+    // Space replays the target note during a session.
+    if (e.code === 'Space' && activeSession && activeSession.prompt && currentScreen === 'session') {
+      const tag = document.activeElement && document.activeElement.tagName;
+      if (tag !== 'INPUT' && tag !== 'BUTTON' && tag !== 'SELECT') {
+        e.preventDefault();
+        playNoteTone(activeSession.prompt.midi, store.settings().a4, 900);
+      }
+    }
+  });
+
+  window.addEventListener('beforeunload', () => store.saveNow());
+  setMicPlate('microphone idle');
+}

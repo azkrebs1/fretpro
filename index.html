@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>FretPro — learn the fretboard by ear</title>
+    <meta name="description" content="Learn every note on the guitar fretboard three at a time, with your own guitar as the input device." />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Anton&family=Archivo:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="css/app.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%231C1712'/%3E%3Cg stroke='%23B9B4A8' stroke-width='2'%3E%3Cline x1='8' y1='4' x2='8' y2='28'/%3E%3Cline x1='16' y1='4' x2='16' y2='28'/%3E%3Cline x1='24' y1='4' x2='24' y2='28'/%3E%3C/g%3E%3Ccircle cx='16' cy='16' r='4.5' fill='%23E8A33D'/%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <div class="rig" id="rig">
+      <!-- Top rail: the amp faceplate -->
+      <header class="rail">
+        <div class="rail-brand">
+          <span class="jewel" id="jewel" aria-hidden="true"></span>
+          <span class="wordmark">FretPro</span>
+          <span class="rail-sub">fretboard trainer</span>
+        </div>
+
+        <nav class="rail-nav" id="nav" aria-label="Sections">
+          <button type="button" data-screen="path" class="navbtn is-active">Path</button>
+          <button type="button" data-screen="drill" class="navbtn">Drill</button>
+          <button type="button" data-screen="progress" class="navbtn">Progress</button>
+          <button type="button" data-screen="setup" class="navbtn">Setup</button>
+        </nav>
+
+        <div class="rail-stats" id="railStats"></div>
+      </header>
+
+      <main class="deck" id="deck">
+        <section class="screen is-active" id="screen-path" aria-label="Learning path"></section>
+        <section class="screen" id="screen-drill" aria-label="Free drills"></section>
+        <section class="screen" id="screen-progress" aria-label="Progress"></section>
+        <section class="screen" id="screen-setup" aria-label="Setup and settings"></section>
+        <section class="screen" id="screen-calibrate" aria-label="Microphone calibration"></section>
+        <section class="screen" id="screen-session" aria-label="Practice session"></section>
+        <section class="screen" id="screen-results" aria-label="Session results"></section>
+      </main>
+
+      <footer class="plate">
+        <span>Standard tuning · frets 0–17</span>
+        <span class="plate-dot" aria-hidden="true"></span>
+        <span id="plateMic">microphone idle</span>
+      </footer>
+    </div>
+
+    <div class="sheet" id="sheet" hidden>
+      <div class="sheet-scrim" data-close-sheet></div>
+      <div class="sheet-card" role="dialog" aria-modal="true" aria-labelledby="sheetTitle" id="sheetCard"></div>
+    </div>
+
+    <div class="toast-stack" id="toasts" aria-live="polite"></div>
+
+    <script type="module" src="js/main.js"></script>
+  </body>
+</html>

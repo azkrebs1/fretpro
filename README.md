@@ -1,0 +1,131 @@
+# FretPro
+
+Learn every note on the guitar fretboard, three at a time, using your guitar as the input device.
+
+Three notes on one string, then three more, then the whole string, then two strings
+together — widening until the whole neck is one map. Play the note it asks for and it
+moves on; play the wrong one and it goes red until you find the right one.
+
+## Running it
+
+```bash
+npm start
+```
+
+Then open **http://localhost:5173**.
+
+The microphone only works on a secure origin. `http://localhost` counts as one;
+double-clicking `index.html` does not, so use the server. Any static server works —
+`python -m http.server 5173` is equivalent.
+
+Progress lives in the browser's localStorage, so use the same browser each time.
+Setup → Data has export and import if you want a backup.
+
+## How practice works
+
+**Calibration.** Before a session it listens to three seconds of your room, then asks
+you to play. The threshold lands in the gap between the two — a third of the way up
+from the room toward your guitar — because the noise floor on its own says nothing
+about how much headroom your playing actually has. Recalibrate when you move rooms or
+change mics; Setup chooses whether that happens every session, only when the last one
+is stale (default), or never.
+
+**What counts as a played note.** A gate only rejects things that are *quiet*. Telling
+a note from a chair creak, a voice or a knock takes more than loudness, so a sound must
+also hold a steady pitch, clearly enough, for long enough. Setup → *What counts as a
+played note* has three settings; go to Strict if stray sounds are answering for you.
+
+**The app never answers its own prompts.** Feedback beeps and the "Hear it" button come
+out of the speakers and straight back into the microphone, so every sound the app makes
+holds detection off until it has died away.
+
+**Judging.** Pitch detection is YIN, running about 60 times a second on a 2× decimated
+buffer. A note has to hold steady across several frames before it counts, which keeps
+string squeaks and fret noise from answering for you. Steadiness is measured on the
+raw pitch rather than the note name, so a note sitting between two frets still settles
+instead of flickering.
+
+A guitar note rings for seconds, so after each answer the engine closes and will not
+reopen until the string is released, a fresh attack arrives, or a clearly different
+pitch settles. A new prompt never forces it open — otherwise the note you just played
+would answer the next question for you.
+
+**How close you have to be.** Setup has a *How far off still counts* slider, ±20 to
+±85 cents, default ±70. Judging works on the un-rounded pitch, so the window can be
+wider than the ±50 cents you would get from snapping to the nearest semitone first —
+a guitar that has drifted well flat still passes. The next fret is 100 cents away, so
+at the default there are 30 cents of margin before a wrong fret could sneak through.
+When an accepted note is more than 35 cents off, the session says so, which is usually
+the first sign the guitar needs tuning.
+
+By default a right note in the wrong octave counts as correct, and the app says so.
+Setup can tighten that to exact-string-only.
+
+**The clock.** One slider in Setup, from 20 seconds down to no clock at all. Higher
+lesson levels tighten it — level 2 runs at 80% of your setting, level 3 at 65% — which
+you can switch off. When the clock runs out the answer is revealed and the note is
+marked as missed.
+
+**Scheduling.** Every position on the neck carries its own record. Answer it quickly
+and correctly and it moves up a box, coming back in minutes, then hours, then days,
+then weeks. Miss it and it drops two boxes and starts turning up much more often.
+Nothing you have learned is ever dropped from rotation.
+
+**Levels.** Each lesson has three: Learn (12 prompts, 75% to pass), Practice (15
+prompts, 85%), Master (20 prompts, 90%). Clearing level 1 unlocks the next lesson.
+Only first-try answers count toward accuracy.
+
+## Without a guitar
+
+Setup → Input → *Tap the board* swaps the microphone for the on-screen fretboard.
+Same lessons, same scheduling, same progress — useful on a train.
+
+## The path
+
+13 units, 108 positions, frets 0 to 17:
+
+1–2. Low E and A strings, natural notes, three at a time
+3. E and A together
+4–5. D and G strings
+6. The bass four together
+7–8. B and high E strings
+9. All six strings, naturals
+10–11. Sharps and flats, bass strings then treble
+12. Every note, frets 0–12, by position
+13. Past the octave, frets 12–17
+
+## Layout
+
+```
+index.html          shell and screen containers
+css/app.css         the whole visual system
+js/theory.js        tuning, note naming, fretboard math
+js/curriculum.js    the unit/lesson path
+js/srs.js           spaced repetition and mastery scoring
+js/store.js         localStorage persistence
+js/audio.js         mic capture, calibration, YIN pitch detection
+js/fretboard.js     SVG board: prompts, tap input, heat map
+js/session.js       the prompt/judge/advance loop
+js/ui.js            screens and wiring
+js/main.js          boot
+server.js           zero-dependency static server
+test/logic.test.js  node --test
+```
+
+## Tests
+
+```bash
+npm test
+```
+
+Covers the fretboard math, the shape of the path, the scheduling rules, and pitch
+detection against synthesised plucks at all 108 positions — including a weak
+fundamental, a missing fundamental, and a noisy room.
+
+## Notes
+
+- The path is laid out for standard tuning. Other tunings are supported and everything
+  follows them, but a lesson built around natural notes may include a sharp once the
+  strings move.
+- Sound feedback and the count-in can be turned off in Setup.
+- Space replays the target note during a session.
