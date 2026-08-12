@@ -22,6 +22,7 @@ import { detectPitch, computeRms, isPitchStable, PitchEngine, SENSITIVITY } from
 import { Session } from '../js/session.js';
 import * as store from '../js/store.js';
 import * as cloud from '../js/cloud.js';
+import { normalizeProjectUrl } from '../js/config.js';
 
 /* ---------- theory ---------------------------------------------------- */
 
@@ -386,6 +387,25 @@ test('usernames are normalised and checked the same way the database does it', (
   assert.equal(cloud.validateUsername('good-name_9').ok, true);
 });
 
+test('the project URL is accepted in every form the dashboard shows it', () => {
+  const want = 'https://qsyxckyodnzoyrqayusd.supabase.co';
+  // The dashboard displays the REST endpoint, which is the natural thing to copy.
+  assert.equal(normalizeProjectUrl('https://qsyxckyodnzoyrqayusd.supabase.co/rest/v1/'), want);
+  assert.equal(normalizeProjectUrl('https://qsyxckyodnzoyrqayusd.supabase.co/rest/v1'), want);
+  assert.equal(normalizeProjectUrl('https://qsyxckyodnzoyrqayusd.supabase.co/'), want);
+  assert.equal(normalizeProjectUrl('https://qsyxckyodnzoyrqayusd.supabase.co'), want);
+  assert.equal(normalizeProjectUrl('  https://qsyxckyodnzoyrqayusd.supabase.co///  '), want);
+  assert.equal(normalizeProjectUrl('qsyxckyodnzoyrqayusd.supabase.co'), want, 'a missing scheme is filled in');
+  assert.equal(normalizeProjectUrl(''), '');
+  assert.equal(normalizeProjectUrl(null), '');
+});
+
+test('the normalised URL builds the endpoint that actually answered', () => {
+  const base = normalizeProjectUrl('https://example.supabase.co/rest/v1/');
+  assert.equal(`${base}/rest/v1/rpc/get_profile`, 'https://example.supabase.co/rest/v1/rpc/get_profile');
+  assert.ok(!`${base}/rest/v1/rpc/get_profile`.includes('/rest/v1/rest/v1'), 'the doubled path was the whole bug');
+});
+
 test('the upload leaves microphone calibration and the device id behind', () => {
   store.resetAll();
   store.setCalibration({ gate: 0.02, noiseFloor: 0.004 });
@@ -475,14 +495,21 @@ test('a device that has never practised is recognised as empty', () => {
   store.resetAll();
 });
 
-test('signing in is refused before a project is connected', async () => {
-  assert.equal(cloud.isCloudConfigured(), false, 'no credentials are committed to the repo');
-  await assert.rejects(() => cloud.signIn('someone'), /not configured/i);
-});
-
-test('a bad username is rejected before any network call', async () => {
+test('a bad username is rejected locally, before anything reaches the network', async () => {
+  // Deliberately network-free: the name is checked before the project is, so
+  // running the tests never touches a real Supabase project even when
+  // js/config.js has live credentials in it.
   await assert.rejects(() => cloud.signIn('no'.repeat(40)), /too long/i);
   await assert.rejects(() => cloud.signIn('bad name'), /letters, numbers/i);
+  await assert.rejects(() => cloud.signIn(''), /pick a username/i);
+});
+
+test('signing in is refused outright when no project is connected', async (t) => {
+  if (cloud.isCloudConfigured()) {
+    t.skip('js/config.js has live credentials, so this path cannot be reached here');
+    return;
+  }
+  await assert.rejects(() => cloud.signIn('someone'), /not configured/i);
 });
 
 /* ---------- not answering with the wrong sound ------------------------ */

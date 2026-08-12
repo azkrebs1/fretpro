@@ -36,14 +36,31 @@ export function writeOverride(url, key) {
   }
 }
 
+/**
+ * Reduce whatever was pasted to the project root.
+ *
+ * The Supabase dashboard shows the REST endpoint as
+ * `https://<project>.supabase.co/rest/v1/`, and that is the natural thing to
+ * copy — but this app builds the `/rest/v1/...` path itself, so keeping it
+ * would request `/rest/v1/rest/v1/...` and 404. Accept either form.
+ */
+export function normalizeProjectUrl(raw) {
+  let url = String(raw == null ? '' : raw).trim();
+  if (!url) return '';
+  if (!/^https?:\/\//i.test(url)) url = `https://${url}`;
+  const restAt = url.toLowerCase().indexOf('/rest/v1');
+  if (restAt > -1) url = url.slice(0, restAt);
+  return url.replace(/\/+$/, '');
+}
+
 /** The connection actually in use: the override if set, otherwise the constants. */
 export function supabaseConfig() {
   const override = readOverride();
   const url = (override && override.url) || SUPABASE_URL;
   const key = (override && override.key) || SUPABASE_ANON_KEY;
   return {
-    url: (url || '').replace(/\/+$/, ''),
-    key: key || '',
+    url: normalizeProjectUrl(url),
+    key: (key || '').trim(),
     fromOverride: Boolean(override && override.url && override.key),
   };
 }

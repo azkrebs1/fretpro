@@ -1532,6 +1532,7 @@ function renderAccountPanel() {
         message,
         h('div', { class: 'help', text: 'A name nobody has used yet becomes yours, starting from whatever is already on this device. An existing name loads its progress and merges this device into it.' }),
       ]),
+      h('div', { class: 'btn-row', style: 'margin:-6px 0 16px' }, [testConnectionButton()]),
       h('div', { class: 'banner is-bad' }, [
         h('b', { text: 'No password means no privacy' }),
         'Anyone who guesses your username can load and overwrite this profile. That is the trade for signing in without one, so keep it to practice progress and pick a name that is not obvious if that matters to you.',
@@ -1594,6 +1595,29 @@ function renderAccountPanel() {
     ])
   );
   return panel;
+}
+
+/** Says which part is wrong — URL, key, or missing schema — without guessing. */
+function testConnectionButton() {
+  const result = h('div', { class: 'help', style: 'flex-basis:100%' });
+  const button = h(
+    'button',
+    {
+      class: 'btn is-ghost',
+      onclick: async () => {
+        button.disabled = true;
+        button.textContent = 'Testing…';
+        result.textContent = '';
+        const outcome = await cloud.testConnection();
+        result.textContent = outcome.message;
+        result.style.color = outcome.ok ? 'var(--green-deep)' : 'var(--red)';
+        button.disabled = false;
+        button.textContent = 'Test connection';
+      },
+    },
+    ['Test connection']
+  );
+  return h('div', { style: 'display:flex;gap:10px;flex-wrap:wrap;align-items:center' }, [button, result]);
 }
 
 /** Lets you point the app at a Supabase project without editing config.js. */

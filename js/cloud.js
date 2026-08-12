@@ -121,14 +121,29 @@ async function rpc(fn, body) {
 
 function describeError(statusCode, body) {
   let detail = '';
+  let code = '';
   try {
     const parsed = JSON.parse(body);
     detail = parsed.message || parsed.hint || parsed.error || '';
+    code = parsed.code || '';
   } catch (err) {
     detail = (body || '').slice(0, 160);
   }
-  if (statusCode === 404) return 'The database is missing its setup — run supabase/schema.sql.';
-  if (statusCode === 401 || statusCode === 403) return 'The Supabase key was rejected. Check the anon key in js/config.js.';
+
+  if (statusCode === 404) {
+    // PostgREST answers PGRST202 when the URL is right but the function is
+    // missing. Anything else at 404 means we never reached PostgREST at all.
+    if (code === 'PGRST202' || /function|schema cache/i.test(detail)) {
+      return 'Connected, but the database has no get_profile/save_profile — run supabase/schema.sql in the Supabase SQL editor.';
+    }
+    return 'No Supabase API at that address. The Project URL should be just https://your-project.supabase.co, without /rest/v1 on the end.';
+  }
+
+  if (statusCode === 401 || statusCode === 403) {
+    return 'Supabase rejected the key. Copy the anon / publishable key from Project Settings → API.';
+  }
+
+  // The schema raises 22023 for a username that fails its own check.
   if (detail) return detail;
   return `The server returned ${statusCode}.`;
 }
@@ -140,6 +155,22 @@ export async function fetchProfile(username) {
 
 export async function saveProfile(username, payload) {
   return rpc('save_profile', { p_username: username, p_state: payload });
+}
+
+/**
+ * Check the connection without signing anyone in or writing anything.
+ * @returns {Promise<{ok:boolean, message:string}>}
+ */
+export async function testConnection() {
+  if (!isCloudConfigured()) return { ok: false, message: 'No project URL or key set yet.' };
+  const { url } = supabaseConfig();
+  try {
+    // A name that passes validation but will not exist; null is the pass.
+    await fetchProfile('connection-test');
+    return { ok: true, message: `Connected to ${url} and the database is set up.` };
+  } catch (err) {
+    return { ok: false, message: err.message };
+  }
 }
 
 /* ---------- sync ------------------------------------------------------- */
