@@ -23,6 +23,8 @@ import { Session } from '../js/session.js';
 import * as store from '../js/store.js';
 import * as cloud from '../js/cloud.js';
 import { normalizeProjectUrl } from '../js/config.js';
+import { boxPositions, oneOctave, ascending, descending, degreeOf, isInScale, boxFits, scaleTitle, SCALES, PC } from '../js/scales.js';
+import { SCALE_LESSONS, EXERCISE, runSteps, lessonPositions, scalePitchSet } from '../js/scaleCurriculum.js';
 
 /* ---------- theory ---------------------------------------------------- */
 
@@ -370,6 +372,149 @@ test('stability looks only at the most recent readings', () => {
 test('rms is the plain root-mean-square', () => {
   assert.equal(computeRms(new Float32Array([1, -1, 1, -1])), 1);
   assert.equal(computeRms(new Float32Array(64)), 0);
+});
+
+/* ---------- scales ----------------------------------------------------- */
+
+const fingering = (positions) => {
+  const byString = {};
+  for (const p of positions) (byString[p.string] ||= []).push(p.fret);
+  return [6, 5, 4, 3, 2, 1].map((s) => `s${s}:${(byString[s] || []).join(',')}`).join('  ');
+};
+
+test('generated boxes match the shapes guitarists actually play', () => {
+  // Hand-checked against the standard CAGED fingerings.
+  assert.equal(
+    fingering(boxPositions('minorPentatonic', PC.A, 0)),
+    's6:5,8  s5:5,7  s4:5,7  s3:5,7  s2:5,8  s1:5,8',
+    'A minor pentatonic box 1'
+  );
+  assert.equal(
+    fingering(boxPositions('minorPentatonic', PC.A, 1)),
+    's6:8,10  s5:7,10  s4:7,10  s3:7,9  s2:8,10  s1:8,10',
+    'box 2 leans below its start on the A string'
+  );
+  assert.equal(
+    fingering(boxPositions('minorPentatonic', PC.A, 2)),
+    's6:10,12  s5:10,12  s4:10,12  s3:9,12  s2:10,13  s1:10,12',
+    'A minor pentatonic box 3'
+  );
+  assert.equal(
+    fingering(boxPositions('majorPentatonic', PC.G, 0)),
+    's6:3,5  s5:2,5  s4:2,5  s3:2,4  s2:3,5  s1:3,5',
+    'G major pentatonic box 1'
+  );
+  assert.equal(
+    fingering(boxPositions('major', PC.C, 0)),
+    's6:8,10,12  s5:8,10,12  s4:9,10,12  s3:9,10,12  s2:10,12,13  s1:10,12,13',
+    'C major three-notes-per-string, including the B-string shift'
+  );
+});
+
+test('a box is one unbroken climb through the scale', () => {
+  for (const [scaleId, root] of [['minorPentatonic', PC.A], ['blues', PC.E], ['major', PC.C], ['dorian', PC.D]]) {
+    for (let box = 0; box < 3; box++) {
+      const positions = boxPositions(scaleId, root, box);
+      for (let i = 1; i < positions.length; i++) {
+        assert.ok(
+          positions[i].midi > positions[i - 1].midi,
+          `${scaleId} box ${box}: pitch must always rise, broke at step ${i}`
+        );
+      }
+    }
+  }
+});
+
+test('every note in a box belongs to the scale, and degrees are labelled', () => {
+  for (const scaleId of Object.keys(SCALES)) {
+    const positions = boxPositions(scaleId, PC.A, 0);
+    assert.ok(positions.length > 0, `${scaleId} produced no shape`);
+    for (const p of positions) {
+      assert.ok(isInScale(scaleId, PC.A, p.midi), `${scaleId}: ${p.string}/${p.fret} is out of the scale`);
+      assert.ok(p.degree, `${scaleId}: ${p.string}/${p.fret} has no degree label`);
+    }
+    assert.ok(positions.some((p) => p.isRoot), `${scaleId} box has no root`);
+  }
+});
+
+test('boxes have the right note count for their scale size', () => {
+  assert.equal(boxPositions('minorPentatonic', PC.A, 0).length, 12, 'two per string');
+  assert.equal(boxPositions('major', PC.C, 0).length, 18, 'three per string');
+});
+
+test('the one-octave run goes root to root', () => {
+  const run = oneOctave(boxPositions('minorPentatonic', PC.A, 0), PC.A);
+  assert.equal(run.length, 6);
+  assert.equal(run[0].degree, '1');
+  assert.equal(run[run.length - 1].degree, '1');
+  assert.equal(run[run.length - 1].midi - run[0].midi, 12, 'exactly one octave apart');
+  assert.deepEqual(run.map((p) => p.degree), ['1', '♭3', '4', '5', '♭7', '1']);
+});
+
+test('degrees are named from the root, and outsiders return null', () => {
+  assert.equal(degreeOf('minorPentatonic', PC.A, 69), '1'); // A
+  assert.equal(degreeOf('minorPentatonic', PC.A, 72), '♭3'); // C
+  assert.equal(degreeOf('minorPentatonic', PC.A, 70), null, 'A# is not in A minor pentatonic');
+  assert.equal(degreeOf('blues', PC.A, 75), '♭5', 'the blue note');
+});
+
+test('a descending run is the ascending one backwards', () => {
+  const positions = boxPositions('minorPentatonic', PC.A, 0);
+  const up = ascending(positions);
+  const down = descending(positions);
+  assert.deepEqual(down.map((p) => p.midi), [...up.map((p) => p.midi)].reverse());
+});
+
+test('runs never ask for the same pitch twice in a row', () => {
+  for (const lesson of SCALE_LESSONS.filter((l) => l.exercise === EXERCISE.RUN)) {
+    const steps = runSteps(lesson);
+    assert.ok(steps.length >= 5, `${lesson.id} is too short to be a run`);
+    for (let i = 1; i < steps.length; i++) {
+      assert.notEqual(steps[i].midi, steps[i - 1].midi, `${lesson.id} repeats a pitch at step ${i}`);
+    }
+  }
+});
+
+test('every scale lesson is playable and chained in order', () => {
+  const ids = new Set(SCALE_LESSONS.map((l) => l.id));
+  assert.equal(ids.size, SCALE_LESSONS.length, 'lesson ids must be unique');
+  SCALE_LESSONS.forEach((lesson, i) => {
+    assert.equal(lesson.requires, i === 0 ? null : SCALE_LESSONS[i - 1].id);
+    assert.ok(lesson.prompts >= 1 && lesson.seconds >= 4, `${lesson.id} has a silly budget`);
+    const positions = boxPositions(lesson.scaleId, lesson.rootPc, lesson.boxIndex);
+    assert.ok(positions.length > 0, `${lesson.id} has no shape`);
+    for (const p of positions) {
+      assert.ok(p.fret >= 0 && p.fret <= 20, `${lesson.id} runs off the neck at fret ${p.fret}`);
+      assert.ok(p.string >= 1 && p.string <= 6);
+    }
+    if (lesson.exercise === EXERCISE.ROOT) {
+      assert.ok(lessonPositions(lesson).every((p) => p.isRoot), `${lesson.id} should only offer roots`);
+    }
+  });
+});
+
+test('every scale shape in the track fits on the neck', () => {
+  for (const lesson of SCALE_LESSONS) {
+    assert.ok(
+      boxFits(lesson.scaleId, lesson.rootPc, lesson.boxIndex),
+      `${lesson.id}: ${scaleTitle(lesson.scaleId, lesson.rootPc)} box ${lesson.boxIndex + 1} does not fit`
+    );
+  }
+});
+
+test('the stay-in-key set is exactly the scale, no more', () => {
+  const lesson = SCALE_LESSONS.find((l) => l.exercise === EXERCISE.KEY);
+  const allowed = scalePitchSet(lesson);
+  assert.equal(allowed.size, SCALES[lesson.scaleId].intervals.length);
+  for (const p of boxPositions(lesson.scaleId, lesson.rootPc, lesson.boxIndex)) {
+    assert.ok(allowed.has(pitchClass(p.midi)), 'every note of the shape must be accepted');
+  }
+});
+
+test('the track opens on minor pentatonic, as chosen', () => {
+  assert.equal(SCALE_LESSONS[0].scaleId, 'minorPentatonic');
+  assert.equal(SCALE_LESSONS[0].exercise, EXERCISE.RUN);
+  assert.equal(SCALE_LESSONS[0].octaveOnly, true, 'start with one octave, not the whole box');
 });
 
 /* ---------- accounts and cloud saves ---------------------------------- */

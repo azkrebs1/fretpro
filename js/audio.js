@@ -158,6 +158,14 @@ export class PitchEngine {
     this.setGate(this.baseGate);
   }
 
+  /**
+   * Trade a little certainty for speed. A scale run plays notes far faster than
+   * a single-note prompt, and waiting four frames for each one drops notes.
+   */
+  setStableFrames(frames) {
+    this.stableFrames = Math.max(2, Math.min(6, frames));
+  }
+
   setA4(a4) {
     this.a4 = a4 || 440;
   }
@@ -436,9 +444,11 @@ function toneContext() {
 }
 
 /** A short plucked-ish tone, used for "hear this note" and for feedback. */
-export function playTone(freq, ms = 700, { type = 'triangle', gain = 0.16 } = {}) {
+export function playTone(freq, ms = 700, { type = 'triangle', gain = 0.16, announce = true } = {}) {
   // Speakers feed the microphone; hold detection off until this has died away.
-  announceSelfNoise(ms + 320);
+  // `announce: false` is only for tones pitched outside the detection band,
+  // which cannot be misheard as a played note and must not deafen a scale run.
+  if (announce) announceSelfNoise(ms + 320);
   try {
     const ctx = toneContext();
     const now = ctx.currentTime;
@@ -469,6 +479,13 @@ export function playCorrect() {
 
 export function playWrong() {
   playTone(150, 220, { type: 'sawtooth', gain: 0.07 });
+}
+
+/** Quiet tick for each accepted note mid-run — must not mask the next note.
+    1760 Hz sits above FMAX, so detection cannot mistake it for a played note
+    and it deliberately does not suppress the microphone. */
+export function playStep() {
+  playTone(1760, 45, { type: 'sine', gain: 0.045, announce: false });
 }
 
 export function playLevelUp() {

@@ -1,6 +1,6 @@
 /* Screens, rendering and wiring. */
 
-import { midiAt, noteName, splitName, posKey, parsePosKey, isNatural, TUNINGS, MAX_FRET } from './theory.js';
+import { midiAt, noteName, splitName, posKey, parsePosKey, isNatural, pitchClass, TUNINGS, MAX_FRET } from './theory.js';
 import { LESSONS, LESSON_BY_ID, UNITS, MAX_LEVEL, levelSpec, ALL_POSITIONS, poolPitchClasses } from './curriculum.js';
 import * as store from './store.js';
 import { mastery, isDue } from './srs.js';
@@ -9,6 +9,17 @@ import { createFretboard, noteBadge } from './fretboard.js';
 import { Session, effectiveTimer } from './session.js';
 import * as cloud from './cloud.js';
 import { supabaseConfig, writeOverride } from './config.js';
+import { boxPositions, boxWindow, scaleTitle, SCALES, SCALE_MAX_FRET } from './scales.js';
+import {
+  SCALE_UNITS,
+  SCALE_LESSONS,
+  SCALE_LESSON_BY_ID,
+  EXERCISE,
+  runSteps,
+  lessonPositions,
+  scaleNodeLabel,
+  scalePitchSet,
+} from './scaleCurriculum.js';
 
 /* ---------- tiny DOM helper ------------------------------------------ */
 
@@ -353,6 +364,205 @@ function openLessonSheet(lessonId) {
   );
 }
 
+/* ---------- scales track ---------------------------------------------- */
+
+/** Scales open once the note path has covered every string. */
+export const SCALES_GATE_LESSON = 'mix-all-all';
+
+export function scalesUnlocked() {
+  return store.settings().scalesUnlockedEarly === true || store.lessonProgress(SCALES_GATE_LESSON).level >= 1;
+}
+
+export function scaleLessonState(lesson) {
+  if (!scalesUnlocked()) return 'locked';
+  const prog = store.lessonProgress(lesson.id);
+  const prevDone = !lesson.requires || store.lessonProgress(lesson.requires).level >= 1;
+  if (prog.level >= MAX_LEVEL) return 'done';
+  if (prog.level >= 1) return 'started';
+  return prevDone ? 'next' : 'locked';
+}
+
+function firstOpenScaleLesson() {
+  return (
+    SCALE_LESSONS.find((l) => ['next', 'started'].includes(scaleLessonState(l))) || SCALE_LESSONS[SCALE_LESSONS.length - 1]
+  );
+}
+
+export function renderScales() {
+  const root = $('#screen-scales');
+  root.textContent = '';
+  const unlocked = scalesUnlocked();
+  const open = firstOpenScaleLesson();
+
+  root.appendChild(
+    h('div', { class: 'path-head' }, [
+      h('div', {}, [
+        h('div', { class: 'eyebrow', text: 'Shapes, not just notes' }),
+        h('h1', { text: 'Scales' }),
+        h('p', { class: 'lede', text: 'Climb a shape in order, find its roots, name its degrees, then improvise inside it. Every note you play here also counts toward your fretboard mastery.' }),
+      ]),
+    ])
+  );
+
+  if (!unlocked) {
+    root.appendChild(
+      h('div', { class: 'banner' }, [
+        h('b', { text: 'Locked for now' }),
+        'Scales open once you clear "Anywhere" in the All six strings unit. Shapes only mean something when you already know what the notes are called — but it is your neck, so skip ahead if you want.',
+        h('div', { class: 'btn-row', style: 'margin-top:14px' }, [
+          h('button', {
+            class: 'btn',
+            onclick: () => {
+              store.setSetting('scalesUnlockedEarly', true);
+              renderScales();
+              toast('Scales unlocked.', 'good');
+            },
+          }, ['Open it anyway']),
+        ]),
+      ])
+    );
+  } else {
+    root.appendChild(
+      h('div', { class: 'btn-row', style: 'margin-bottom:8px' }, [
+        h('button', { class: 'btn is-primary', onclick: () => startScaleLesson(open.id) }, [`Continue · ${open.title}`]),
+      ])
+    );
+  }
+
+  const neck = h('div', { class: 'neck' });
+  SCALE_UNITS.forEach((unit, ui) => {
+    const unitLessons = SCALE_LESSONS.filter((l) => l.unitId === unit.id);
+    const allLocked = unitLessons.every((l) => scaleLessonState(l) === 'locked');
+    const unitEl = h('section', { class: `neck-unit ${allLocked ? 'unit-locked' : ''}` }, [
+      h('div', { class: 'unit-head' }, [
+        h('span', { class: 'unit-num', text: `S${String(ui + 1).padStart(2, '0')}` }),
+        h('h2', { text: unit.title }),
+        h('p', { text: allLocked && !unlocked ? 'Locked' : unit.blurb }),
+      ]),
+    ]);
+
+    const strip = h('div', { class: 'neck-strip' });
+    unitLessons.forEach((lesson, li) => {
+      const state = scaleLessonState(lesson);
+      const prog = store.lessonProgress(lesson.id);
+      const side = li % 2 === 0 ? 'on-right' : 'on-left';
+      const node = h(
+        'button',
+        {
+          type: 'button',
+          class: `node ${state === 'locked' ? 'is-locked' : ''} ${state === 'next' ? 'is-next' : ''} ${
+            state === 'done' ? 'is-done' : ''
+          } ${lesson.milestone ? 'is-milestone' : ''}`,
+          disabled: state === 'locked',
+          'aria-label': `${lesson.title} — ${lesson.subtitle}`,
+          onclick: () => openScaleSheet(lesson.id),
+        },
+        [
+          h('span', { class: 'node-label', text: scaleNodeLabel(lesson) }),
+          h(
+            'span',
+            { class: 'node-pips' },
+            [0, 1, 2].map((i) => h('i', { class: i < prog.level ? 'is-on' : '' }))
+          ),
+        ]
+      );
+
+      strip.appendChild(
+        h('div', { class: 'node-row' }, [
+          node,
+          h('div', { class: `node-caption ${side}` }, [
+            h('b', { text: lesson.title }),
+            lesson.subtitle,
+            h('em', { text: state === 'locked' ? ' · locked' : ` · level ${prog.level}/${MAX_LEVEL}` }),
+          ]),
+        ])
+      );
+    });
+
+    unitEl.appendChild(strip);
+    neck.appendChild(unitEl);
+  });
+
+  root.appendChild(neck);
+}
+
+function openScaleSheet(lessonId) {
+  const lesson = SCALE_LESSON_BY_ID.get(lessonId);
+  if (scaleLessonState(lesson) === 'locked') return;
+  const prog = store.lessonProgress(lessonId);
+  const target = Math.min(MAX_LEVEL, prog.level + 1);
+  const spec = levelSpec(target - 1);
+  const seconds = Math.max(4, Math.round(lesson.seconds * spec.timerScale));
+
+  const explain =
+    lesson.exercise === EXERCISE.RUN
+      ? `Play all ${runSteps(lesson).length} notes in order. ${target >= 3 ? 'At this level a wrong note restarts the run.' : 'A wrong note just waits for you to find the right one.'}`
+      : lesson.exercise === EXERCISE.KEY
+      ? `Play ${lesson.notesNeeded} notes from the scale in any order, using every note of it at least once. Anything outside the scale shows red.`
+      : lesson.exercise === EXERCISE.ROOT
+      ? 'Play the root wherever it appears in the shape.'
+      : 'Play the degree it names, anywhere in the shape.';
+
+  openSheet(
+    `${scaleTitle(lesson.scaleId, lesson.rootPc)} · ${lesson.title}`,
+    [
+      h('p', { class: 'lede', text: lesson.subtitle }),
+      h('div', { class: 'result-grid', style: 'margin:16px 0 6px' }, [
+        h('div', { class: 'tile' }, [h('span', { text: 'Level' }), h('b', { text: `${prog.level}/${MAX_LEVEL}` }), h('small', { text: spec.label })]),
+        h('div', { class: 'tile' }, [
+          h('span', { text: lesson.exercise === EXERCISE.RUN ? 'Runs' : 'Rounds' }),
+          h('b', { text: String(lesson.prompts) }),
+        ]),
+        h('div', { class: 'tile' }, [h('span', { text: 'Clock each' }), h('b', { text: `${seconds}s` })]),
+      ]),
+      h('p', { class: 'help', text: explain }),
+    ],
+    [
+      h('button', { class: 'btn is-primary', onclick: () => { closeSheet(); startScaleLesson(lessonId); } }, [
+        prog.level >= MAX_LEVEL ? 'Practice again' : `Start level ${target}`,
+      ]),
+      h('button', { class: 'btn is-ghost', onclick: closeSheet }, ['Cancel']),
+    ]
+  );
+}
+
+export function startScaleLesson(lessonId) {
+  const lesson = SCALE_LESSON_BY_ID.get(lessonId);
+  const prog = store.lessonProgress(lessonId);
+  const target = Math.min(MAX_LEVEL, prog.level + 1);
+  const spec = levelSpec(target - 1);
+  const s = store.settings();
+  const positions = boxPositions(lesson.scaleId, lesson.rootPc, lesson.boxIndex);
+
+  const config = {
+    exercise: lesson.exercise,
+    scaleLessonId: lessonId,
+    lessonId,
+    targetLevel: target,
+    title: `${scaleTitle(lesson.scaleId, lesson.rootPc, s.spelling)} · ${lesson.title}`,
+    prompts: lesson.prompts,
+    timerSeconds: Math.max(4, Math.round(lesson.seconds * spec.timerScale)),
+    inputMode: s.inputMode,
+    promptStyle: 'name',
+    boxPositions: positions,
+    scaleId: lesson.scaleId,
+    rootPc: lesson.rootPc,
+    // Level 3 makes a fumbled run start again, the way you would practise it.
+    restartOnError: target >= MAX_LEVEL,
+  };
+
+  if (lesson.exercise === EXERCISE.RUN) {
+    config.steps = runSteps(lesson);
+  } else if (lesson.exercise === EXERCISE.KEY) {
+    config.allowedPcs = scalePitchSet(lesson);
+    config.notesNeeded = lesson.notesNeeded || 12;
+  } else {
+    config.pool = lessonPositions(lesson);
+  }
+
+  beginSession(config);
+}
+
 /* ---------- starting sessions ---------------------------------------- */
 
 export function startLesson(lessonId) {
@@ -635,6 +845,7 @@ function runSession(config) {
   const boardHost = h('div', { class: 'board-wrap' });
   const choices = h('div', { class: 'choices' });
   const hint = h('div', { class: 'hint-line', text: micMode ? 'Play the note on your guitar.' : 'Tap the fret on the board.' });
+  const runProgress = h('div', { class: 'run-progress', hidden: true });
 
   const quitBtn = h('button', { class: 'btn is-ghost', onclick: () => confirmQuit() }, ['Quit']);
   const hearBtn = h('button', { class: 'btn is-ghost', onclick: () => playCurrentTone() }, ['Hear it']);
@@ -648,15 +859,24 @@ function runSession(config) {
     ]),
     stage,
     choices,
+    runProgress,
     hint,
     boardHost,
     h('div', { class: 'session-foot' }, [hearBtn, revealBtn, h('div', { class: 'spacer' }), quitBtn])
   );
 
-  // Board: show the working range for this pool, plus a little air around it.
-  const frets = config.pool.map((n) => n.fret);
-  const minFret = 0;
-  const maxFret = Math.min(MAX_FRET, Math.max(12, Math.max(...frets) + 1));
+  // Board: a scale lesson shows just its shape; a note lesson shows the neck.
+  const isScale = Boolean(config.exercise && config.exercise !== 'note');
+  let minFret = 0;
+  let maxFret = 12;
+  if (isScale) {
+    const win = boxWindow(config.boxPositions, 1);
+    minFret = win.minFret;
+    maxFret = win.maxFret;
+  } else {
+    const frets = config.pool.map((n) => n.fret);
+    maxFret = Math.min(MAX_FRET, Math.max(12, Math.max(...frets) + 1));
+  }
   sessionBoard = createFretboard(boardHost, {
     minFret,
     maxFret,
@@ -694,11 +914,18 @@ function runSession(config) {
       showScreen('results');
       renderRail();
       renderPath();
+      renderScales();
     },
   });
 
   activeSession = session;
   session.attach(micMode ? engine : null);
+
+  // A run plays notes far faster than a single prompt, so accept each one a
+  // frame sooner. Restored from the user's setting when the session ends.
+  if (micMode && isScale && config.exercise === 'run') {
+    engine.setStableFrames(3);
+  }
 
   if (micMode) {
     meterUnsub = engine.onFrame((frame) => {
@@ -736,6 +963,11 @@ function runSession(config) {
     updatePips(session);
     choices.textContent = '';
     glyphSlot.textContent = '';
+
+    if (isScale) {
+      paintScalePrompt(prompt);
+      return;
+    }
 
     if (prompt.style === 'name') {
       verb.textContent = micMode ? 'play this note' : 'tap this note';
@@ -778,8 +1010,138 @@ function runSession(config) {
     }
   }
 
+  /** Ghost the whole shape, so the box is always visible while you work in it. */
+  function shapeGhosts() {
+    return config.boxPositions.map((p) => ({ string: p.string, fret: p.fret, kind: 'ghost' }));
+  }
+
+  function paintScalePrompt(prompt) {
+    const scaleName = scaleTitle(config.scaleId, config.rootPc, s.spelling);
+
+    if (prompt.kind === 'run') {
+      verb.textContent = 'play in order';
+      paintRunBoard(prompt);
+      where.firstChild.textContent = scaleName;
+      where.lastChild.textContent = `${prompt.steps.length} notes`;
+      hint.textContent = config.restartOnError
+        ? 'A wrong note sends you back to the start of the run.'
+        : 'A wrong note waits for you — find the right one and carry on.';
+      return;
+    }
+
+    if (prompt.kind === 'membership') {
+      verb.textContent = 'stay in key';
+      glyphSlot.appendChild(h('div', { class: 'glyph', text: `0/${prompt.needed}` }));
+      where.firstChild.textContent = scaleName;
+      where.lastChild.textContent = 'your notes, your order';
+      sessionBoard.setMarkers(shapeGhosts());
+      hint.textContent = `Any note in the shape. Use all ${prompt.distinctNeeded} of them, and no note twice in a row.`;
+      return;
+    }
+
+    // degree / root
+    const label = prompt.style === EXERCISE.ROOT ? shortName(prompt.note.string, prompt.note.fret) : prompt.degree || '?';
+    verb.textContent = prompt.style === EXERCISE.ROOT ? 'play the root' : 'play this degree';
+    glyphSlot.appendChild(h('div', { class: 'glyph', text: label }));
+    where.firstChild.textContent = scaleName;
+    where.lastChild.textContent = prompt.style === EXERCISE.ROOT ? 'anywhere in the shape' : 'any octave';
+    sessionBoard.setMarkers(shapeGhosts());
+    hint.textContent = 'Anywhere in the shape counts.';
+  }
+
+  function paintRunBoard(prompt) {
+    const markers = [];
+    prompt.steps.forEach((step, i) => {
+      if (i < prompt.stepIndex) markers.push({ ...step, kind: 'correct' });
+      else if (i === prompt.stepIndex) markers.push({ ...step, kind: 'target', pulse: true, label: step.degree });
+      else markers.push({ string: step.string, fret: step.fret, kind: 'ghost' });
+    });
+    sessionBoard.setMarkers(markers);
+
+    const step = prompt.steps[prompt.stepIndex];
+    glyphSlot.textContent = '';
+    if (step) {
+      const g = glyphFor(noteName(step.midi, s.spelling));
+      glyphSlot.appendChild(g);
+    }
+    counter.firstChild.textContent = String(prompt.number);
+    runProgress.textContent = `note ${Math.min(prompt.stepIndex + 1, prompt.steps.length)} of ${prompt.steps.length}`;
+    runProgress.hidden = false;
+  }
+
   function paintJudgement(info, sess) {
     const prompt = sess.prompt;
+
+    if (info.verdict === 'step') {
+      stage.className = 'stage';
+      verdict.className = 'verdict is-correct';
+      if (prompt.kind === 'run') {
+        paintRunBoard(prompt);
+        verdict.textContent = '';
+      } else {
+        glyphSlot.textContent = '';
+        glyphSlot.appendChild(h('div', { class: 'glyph', text: `${info.counted}/${info.needed}` }));
+        const missing = info.distinctNeeded - info.distinct;
+        verdict.textContent = missing > 0 ? `${missing} more of the scale still to use` : 'all notes used — keep going';
+        sessionBoard.setMarkers([
+          ...shapeGhosts(),
+          ...config.boxPositions
+            .filter((p) => prompt.distinct.has(pitchClass(p.midi)))
+            .map((p) => ({ string: p.string, fret: p.fret, kind: 'correct' })),
+        ]);
+      }
+      return;
+    }
+
+    if (info.verdict === 'repeat') {
+      verdict.className = 'verdict';
+      verdict.textContent = 'Same note again — pick a different one.';
+      return;
+    }
+
+    if (isScale) {
+      if (info.verdict === 'correct') {
+        stage.className = 'stage is-correct';
+        const g = glyphSlot.firstChild;
+        if (g) g.classList.add('is-correct');
+        if (prompt.kind === 'run') {
+          sessionBoard.setMarkers(prompt.steps.map((st) => ({ ...st, kind: 'correct' })));
+        }
+        verdict.className = 'verdict is-correct';
+        verdict.textContent = info.firstTry
+          ? `Clean — ${(info.ms / 1000).toFixed(1)}s`
+          : `Done in ${(info.ms / 1000).toFixed(1)}s, with ${sess.wrongThisPrompt.length} slip${sess.wrongThisPrompt.length === 1 ? '' : 's'}`;
+        updatePips(sess);
+        return;
+      }
+      if (info.verdict === 'wrong') {
+        stage.className = 'stage is-wrong';
+        verdict.className = 'verdict is-wrong';
+        if (info.outOfKey) {
+          verdict.textContent = `${info.playedName} is not in this scale.`;
+        } else if (info.restarted) {
+          verdict.textContent = `That was ${info.playedName} — back to the top of the run.`;
+          paintRunBoard(prompt);
+        } else {
+          verdict.textContent = `That was ${info.playedName} — the run wants ${noteName(info.expected.midi, s.spelling)}.`;
+        }
+        setTimeout(() => {
+          if (sess.state === 'awaiting') stage.className = 'stage';
+        }, 420);
+        return;
+      }
+      if (info.verdict === 'timeout') {
+        stage.className = 'stage is-revealed';
+        verdict.className = 'verdict is-wrong';
+        verdict.textContent =
+          prompt.kind === 'run'
+            ? `Time — you got ${prompt.stepIndex} of ${prompt.steps.length} notes.`
+            : `Time — ${prompt.counted || 0} of ${prompt.needed} notes.`;
+        updatePips(sess);
+        return;
+      }
+    }
+
     if (info.verdict === 'correct') {
       stage.className = 'stage is-correct';
       const g = glyphSlot.firstChild;
@@ -846,7 +1208,18 @@ function nearestMidiWithPc(pc, referenceMidi) {
 
 function confirmQuit() {
   openSheet('Leave this session?', ['Answers so far are already saved against each note, but the session will not count toward the level.'], [
-    h('button', { class: 'btn is-danger', onclick: () => { closeSheet(); cleanupSession(); renderPath(); renderRail(); showScreen('path'); } }, ['Leave']),
+    h('button', {
+      class: 'btn is-danger',
+      onclick: () => {
+        const wasScale = Boolean(activeSession && activeSession.config.scaleLessonId);
+        closeSheet();
+        cleanupSession();
+        renderRail();
+        renderPath();
+        renderScales();
+        showScreen(wasScale ? 'scales' : 'path');
+      },
+    }, ['Leave']),
     h('button', { class: 'btn is-ghost', onclick: closeSheet }, ['Keep going']),
   ]);
 }
@@ -854,6 +1227,8 @@ function confirmQuit() {
 function cleanupSession() {
   if (activeSession) activeSession.stop();
   activeSession = null;
+  // Undo any per-exercise detection tweak.
+  engine.setSensitivity(store.settings().detectionSensitivity);
   if (meterUnsub) meterUnsub();
   meterUnsub = null;
 }
@@ -931,7 +1306,13 @@ function renderResults(summary, config) {
       nextLesson && summary.leveledTo && lessonState(nextLesson) !== 'locked'
         ? h('button', { class: 'btn', onclick: () => startLesson(nextLesson.id) }, ['Next lesson'])
         : null,
-      h('button', { class: 'btn is-ghost', onclick: () => { renderPath(); showScreen('path'); } }, ['Back to path']),
+      h('button', {
+        class: 'btn is-ghost',
+        onclick: () => {
+          if (config.scaleLessonId) { renderScales(); showScreen('scales'); }
+          else { renderPath(); showScreen('path'); }
+        },
+      }, [config.scaleLessonId ? 'Back to scales' : 'Back to path']),
     ])
   );
 }
@@ -1753,6 +2134,7 @@ function confirmReset() {
 export function renderAll() {
   renderRail();
   renderPath();
+  renderScales();
   renderDrill();
   renderProgress();
   renderSetup();
@@ -1777,6 +2159,7 @@ export function boot() {
         confirmQuit();
         return;
       }
+      if (target === 'scales') renderScales();
       if (target === 'progress') renderProgress();
       if (target === 'drill') renderDrill();
       if (target === 'setup') renderSetup();

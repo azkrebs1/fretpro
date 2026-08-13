@@ -1071,6 +1071,16 @@ p {
   color: var(--green-deep);
 }
 
+.run-progress {
+  text-align: center;
+  margin-top: 12px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--sapphire);
+}
+
 .hint-line {
   text-align: center;
   font-size: 12px;

@@ -8,7 +8,7 @@ import { midiAt, noteName, pitchClass, posKey, octaveOf, matchesTarget, octaveRe
 import { pickNext, grade, mastery, isNew } from './srs.js';
 import { levelSpec, MAX_LEVEL } from './curriculum.js';
 import * as store from './store.js';
-import { playCorrect, playWrong } from './audio.js';
+import { playCorrect, playWrong, playStep } from './audio.js';
 
 const REVEAL_MS = 1500;
 const CORRECT_HOLD_MS = 520;
@@ -112,28 +112,34 @@ export class Session {
 
     // The note just answered may still be ringing into this prompt.
     const previous = this.prompt;
-    const note = pickNext(this.config.pool, (k) => this.#record(k), this.lastKey);
-    const midi = midiAt(this.settings.tuning, note.string, note.fret);
-    const style =
-      this.config.promptStyle === 'mixed'
-        ? Math.random() < 0.65
-          ? 'name'
-          : 'position'
-        : this.config.promptStyle;
-
     this.index += 1;
     this.wrongThisPrompt = [];
-    this.prompt = {
-      note,
-      key: posKey(note.string, note.fret),
-      midi,
-      pc: pitchClass(midi),
-      name: noteName(midi, this.settings.spelling),
-      style,
-      number: this.index,
-      shownAt: performance.now(),
-      isNew: isNew(this.#record(posKey(note.string, note.fret))),
-    };
+
+    if (this.config.exercise && this.config.exercise !== 'note') {
+      this.prompt = this.#buildScalePrompt(this.index);
+    } else {
+      const note = pickNext(this.config.pool, (k) => this.#record(k), this.lastKey);
+      const midi = midiAt(this.settings.tuning, note.string, note.fret);
+      const style =
+        this.config.promptStyle === 'mixed'
+          ? Math.random() < 0.65
+            ? 'name'
+            : 'position'
+          : this.config.promptStyle;
+      this.prompt = {
+        kind: 'single',
+        note,
+        key: posKey(note.string, note.fret),
+        midi,
+        pc: pitchClass(midi),
+        name: noteName(midi, this.settings.spelling),
+        style,
+        number: this.index,
+        shownAt: performance.now(),
+        isNew: isNew(this.#record(posKey(note.string, note.fret))),
+      };
+    }
+
     this.lastKey = this.prompt.key;
     this.state = 'awaiting';
     // Do NOT force-arm here. A guitar note rings for seconds, so the note you
@@ -165,6 +171,70 @@ export class Session {
     this.tickId = setInterval(tick, 50);
   }
 
+  /**
+   * Scale prompts. A run walks an ordered list of positions; stay-in-key
+   * accepts anything from a pitch-class set; degree and root are ordinary
+   * single-note prompts wearing a different label.
+   */
+  #buildScalePrompt(number) {
+    const c = this.config;
+    const shownAt = performance.now();
+
+    if (c.exercise === 'run') {
+      const steps = c.steps;
+      return {
+        kind: 'run',
+        steps,
+        stepIndex: 0,
+        note: steps[0],
+        midi: steps[0].midi,
+        pc: pitchClass(steps[0].midi),
+        name: noteName(steps[0].midi, this.settings.spelling),
+        key: posKey(steps[0].string, steps[0].fret),
+        style: 'run',
+        number,
+        shownAt,
+        stepShownAt: shownAt,
+        cleanSteps: 0,
+        stepErrorsSeen: 0,
+      };
+    }
+
+    if (c.exercise === 'membership') {
+      return {
+        kind: 'membership',
+        allowed: c.allowedPcs,
+        needed: c.notesNeeded || 12,
+        distinctNeeded: c.distinctNeeded || c.allowedPcs.size,
+        counted: 0,
+        distinct: new Set(),
+        lastPc: null,
+        key: null,
+        style: 'membership',
+        number,
+        shownAt,
+      };
+    }
+
+    // degree / root: pick a target position, match by pitch class.
+    const note = pickNext(c.pool, (k) => this.#record(k), this.lastKey);
+    const midi = midiAt(this.settings.tuning, note.string, note.fret);
+    return {
+      kind: 'single',
+      note,
+      midi,
+      pc: pitchClass(midi),
+      name: noteName(midi, this.settings.spelling),
+      degree: note.degree || null,
+      key: posKey(note.string, note.fret),
+      style: c.exercise,
+      matchByPitchClass: true,
+      number,
+      shownAt,
+      isNew: isNew(this.#record(posKey(note.string, note.fret))),
+    };
+  }
+
   #onFrame(frame) {
     if (this.state !== 'awaiting' && this.state !== 'wrong') return;
     // The engine already applies the clarity and steadiness bar for the chosen
@@ -181,8 +251,13 @@ export class Session {
    */
   judge(playedMidi, meta = {}) {
     if (this.state !== 'awaiting' && this.state !== 'wrong') return;
-    const strict = this.settings.octaveStrictness === 'strict';
     const playedFloat = meta.midiFloat != null ? meta.midiFloat : playedMidi;
+
+    if (this.prompt && this.prompt.kind === 'run') return this.#judgeRunStep(playedMidi, playedFloat, meta);
+    if (this.prompt && this.prompt.kind === 'membership') return this.#judgeMembership(playedMidi, playedFloat, meta);
+
+    // A degree or root is asked for by interval, so any octave of it is right.
+    const strict = this.prompt && this.prompt.matchByPitchClass ? false : this.settings.octaveStrictness === 'strict';
     const toleranceCents = this.settings.pitchTolerance;
     const ok = matchesTarget(playedFloat, this.prompt.midi, { strict, toleranceCents });
     const samePc = pitchClass(playedMidi) === this.prompt.pc;
@@ -251,6 +326,143 @@ export class Session {
     this.state = 'awaiting';
   }
 
+  /** One note of an ordered run. Wrong notes retry the step, or restart it. */
+  #judgeRunStep(playedMidi, playedFloat, meta) {
+    const prompt = this.prompt;
+    const step = prompt.steps[prompt.stepIndex];
+    const ok = matchesTarget(playedFloat, step.midi, { strict: false, toleranceCents: this.settings.pitchTolerance });
+
+    if (this.engine) this.engine.disarm(playedFloat);
+
+    if (!ok) {
+      this.wrongThisPrompt.push(playedMidi);
+      if (this.settings.sound) playWrong();
+      const restarted = Boolean(this.config.restartOnError) && prompt.stepIndex > 0;
+      if (restarted) {
+        prompt.stepIndex = 0;
+        prompt.cleanSteps = 0;
+      }
+      prompt.stepShownAt = performance.now();
+      this.handlers.onJudged?.(
+        {
+          verdict: 'wrong',
+          playedMidi,
+          playedName: noteName(playedMidi, this.settings.spelling),
+          playedOctave: octaveOf(playedMidi),
+          expected: step,
+          restarted,
+          attempts: this.wrongThisPrompt.length,
+        },
+        this
+      );
+      this.state = 'awaiting';
+      return;
+    }
+
+    // Right note: credit this position in the same schedule the note track uses.
+    const stepMs = performance.now() - prompt.stepShownAt;
+    const cleanStep = this.wrongThisPrompt.length === prompt.stepErrorsSeen;
+    const key = posKey(step.string, step.fret);
+    store.putNoteRecord(key, grade(this.#record(key), cleanStep, stepMs));
+    prompt.stepErrorsSeen = this.wrongThisPrompt.length;
+    prompt.cleanSteps += cleanStep ? 1 : 0;
+    prompt.stepIndex += 1;
+    prompt.stepShownAt = performance.now();
+
+    if (prompt.stepIndex < prompt.steps.length) {
+      const next = prompt.steps[prompt.stepIndex];
+      prompt.note = next;
+      prompt.midi = next.midi;
+      prompt.name = noteName(next.midi, this.settings.spelling);
+      prompt.key = posKey(next.string, next.fret);
+      if (this.settings.sound) playStep();
+      this.handlers.onJudged?.({ verdict: 'step', stepIndex: prompt.stepIndex, total: prompt.steps.length, played: step }, this);
+      this.state = 'awaiting';
+      return;
+    }
+
+    this.#completePrompt(performance.now() - prompt.shownAt);
+  }
+
+  /** Stay in key: any note from the scale, no immediate repeats. */
+  #judgeMembership(playedMidi, playedFloat, meta) {
+    const prompt = this.prompt;
+    const pc = pitchClass(Math.round(playedFloat));
+    const inScale = prompt.allowed.has(pc);
+
+    if (this.engine) this.engine.disarm(playedFloat);
+
+    if (!inScale) {
+      this.wrongThisPrompt.push(playedMidi);
+      if (this.settings.sound) playWrong();
+      this.handlers.onJudged?.(
+        {
+          verdict: 'wrong',
+          playedMidi,
+          playedName: noteName(playedMidi, this.settings.spelling),
+          playedOctave: octaveOf(playedMidi),
+          outOfKey: true,
+          attempts: this.wrongThisPrompt.length,
+        },
+        this
+      );
+      this.state = 'awaiting';
+      return;
+    }
+
+    if (pc === prompt.lastPc) {
+      // Not wrong, just not progress — otherwise one note repeated would pass.
+      this.handlers.onJudged?.({ verdict: 'repeat', playedMidi }, this);
+      this.state = 'awaiting';
+      return;
+    }
+
+    prompt.lastPc = pc;
+    prompt.counted += 1;
+    prompt.distinct.add(pc);
+    if (this.settings.sound) playStep();
+
+    const done = prompt.counted >= prompt.needed && prompt.distinct.size >= prompt.distinctNeeded;
+    this.handlers.onJudged?.(
+      {
+        verdict: done ? 'complete' : 'step',
+        counted: prompt.counted,
+        needed: prompt.needed,
+        distinct: prompt.distinct.size,
+        distinctNeeded: prompt.distinctNeeded,
+        playedMidi,
+      },
+      this
+    );
+
+    if (done) this.#completePrompt(performance.now() - prompt.shownAt);
+    else this.state = 'awaiting';
+  }
+
+  /** Shared finish for run and stay-in-key prompts. */
+  #completePrompt(ms) {
+    const prompt = this.prompt;
+    const firstTry = this.wrongThisPrompt.length === 0;
+    this.state = 'correct';
+    clearInterval(this.tickId);
+    if (this.settings.sound) playCorrect();
+
+    this.results.push({
+      key: prompt.key,
+      note: prompt.note || null,
+      midi: prompt.midi || null,
+      name: prompt.name || prompt.style,
+      correct: firstTry,
+      ms: Math.round(ms),
+      attempts: this.wrongThisPrompt.length + 1,
+      wrong: [...this.wrongThisPrompt],
+      timedOut: false,
+    });
+
+    this.handlers.onJudged?.({ verdict: 'correct', firstTry, ms, complete: true }, this);
+    this.timerId = setTimeout(() => this.#nextPrompt(), CORRECT_HOLD_MS);
+  }
+
   #timeout() {
     if (this.state === 'correct' || this.state === 'revealed' || this.state === 'done') return;
     this.state = 'revealed';
@@ -260,9 +472,9 @@ export class Session {
 
     const result = {
       key: this.prompt.key,
-      note: this.prompt.note,
-      midi: this.prompt.midi,
-      name: this.prompt.name,
+      note: this.prompt.note || null,
+      midi: this.prompt.midi || null,
+      name: this.prompt.name || this.prompt.style,
       correct: false,
       ms: this.config.timerSeconds * 1000,
       attempts: this.wrongThisPrompt.length,
@@ -270,7 +482,9 @@ export class Session {
       timedOut: true,
     };
     this.results.push(result);
-    store.putNoteRecord(this.prompt.key, grade(this.#record(this.prompt.key), false, this.config.timerSeconds * 1000));
+    if (this.prompt.key) {
+      store.putNoteRecord(this.prompt.key, grade(this.#record(this.prompt.key), false, this.config.timerSeconds * 1000));
+    }
 
     this.handlers.onJudged?.({ verdict: 'timeout' }, this);
     this.timerId = setTimeout(() => this.#nextPrompt(), REVEAL_MS);

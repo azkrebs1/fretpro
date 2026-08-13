@@ -27,6 +27,7 @@ export const DEFAULT_SETTINGS = {
   sound: true,
   flipBoard: false, // false = high E on top (tab layout)
   dailyGoal: 2, // sessions per day
+  scalesUnlockedEarly: false, // skip the note-track prerequisite for scales
   deviceId: null,
 };
 

@@ -139,6 +139,36 @@ Only first-try answers count toward accuracy.
 Setup → Input → *Tap the board* swaps the microphone for the on-screen fretboard.
 Same lessons, same scheduling, same progress — useful on a train.
 
+## Scales
+
+A second track, unlocked once the note path clears "All six strings" — shapes only
+mean something once you know what the notes are called. There is an *Open it anyway*
+button on the locked screen if you disagree.
+
+Each unit takes one shape and works it four ways:
+
+- **Runs** — play the shape in order, root to root, then the whole box, ascending and
+  descending. Wrong notes wait for you at levels 1 and 2; at level 3 a slip restarts
+  the run, the way you would actually practise it.
+- **Find the roots** — every root in the shape. This is what lets you move it.
+- **Name the degrees** — "play the ♭3", accepted in any octave.
+- **Stay in key** — improvise: play N notes from the scale in any order, using every
+  note of it at least once, with no note twice in a row. Anything outside the scale
+  shows red.
+
+Order: A minor pentatonic box 1, then box 2, then the same shape moved to E, G and D,
+then major pentatonic, the blues scale, and the major scale in three-notes-per-string.
+
+**Shapes are generated, not typed in.** A box is one unbroken climb through the scale:
+each string picks up at the next scale tone above where the previous string stopped.
+That is the actual definition of both the CAGED boxes and the three-notes-per-string
+system, so the awkward parts — box 2 dipping below its start on the A string, the
+B-string shift — fall out on their own rather than needing special cases. The tests
+check the generated fingerings against the shapes guitarists actually play.
+
+Runs feed the same spaced-repetition schedule as the note track, so practising scales
+also fills in your fretboard heat map.
+
 ## The path
 
 13 units, 108 positions, frets 0 to 17:
@@ -159,7 +189,9 @@ Same lessons, same scheduling, same progress — useful on a train.
 index.html            shell and screen containers
 css/app.css           the whole visual system
 js/theory.js          tuning, note naming, fretboard math
-js/curriculum.js      the unit/lesson path
+js/curriculum.js      the note track's unit/lesson path
+js/scales.js          scale formulas and generated box shapes
+js/scaleCurriculum.js the scales track
 js/srs.js             spaced repetition and mastery scoring
 js/store.js           persistence, and the two-device merge
 js/config.js          Supabase URL and key
