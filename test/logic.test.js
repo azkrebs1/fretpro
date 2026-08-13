@@ -517,6 +517,115 @@ test('the track opens on minor pentatonic, as chosen', () => {
   assert.equal(SCALE_LESSONS[0].octaveOnly, true, 'start with one octave, not the whole box');
 });
 
+/* ---------- finishing a scale session --------------------------------- */
+
+function scaleSessionConfig(lesson, overrides = {}) {
+  return {
+    exercise: lesson.exercise,
+    steps: lesson.exercise === EXERCISE.RUN ? runSteps(lesson) : undefined,
+    allowedPcs: lesson.exercise === EXERCISE.KEY ? scalePitchSet(lesson) : undefined,
+    notesNeeded: lesson.notesNeeded,
+    pool: lesson.exercise === EXERCISE.RUN || lesson.exercise === EXERCISE.KEY ? undefined : lessonPositions(lesson),
+    boxPositions: boxPositions(lesson.scaleId, lesson.rootPc, lesson.boxIndex),
+    scaleId: lesson.scaleId,
+    rootPc: lesson.rootPc,
+    prompts: 1,
+    title: lesson.title,
+    timerSeconds: 0,
+    inputMode: 'tap',
+    promptStyle: 'name',
+    ...overrides,
+  };
+}
+
+test('a completed run ends the session instead of hanging on the last note', async () => {
+  store.resetAll();
+  store.setSetting('countIn', false);
+  store.setSetting('sound', false);
+
+  const lesson = SCALE_LESSONS[0];
+  const steps = runSteps(lesson);
+  let summary = null;
+  const session = new Session(scaleSessionConfig(lesson), { onEnd: (s) => (summary = s) });
+  session.start();
+
+  for (const step of steps) session.judge(step.midi, { midiFloat: step.midi });
+  await sleep(900);
+
+  assert.ok(summary, 'the last note of the last run must end the session');
+  assert.equal(summary.prompts, 1);
+  assert.equal(summary.correct, 1);
+  assert.ok(Number.isFinite(summary.mastery), 'mastery must be a number, not a crash');
+  session.stop();
+  store.resetAll();
+});
+
+test('a completed stay-in-key round ends the session too', async () => {
+  store.resetAll();
+  store.setSetting('countIn', false);
+  store.setSetting('sound', false);
+
+  const lesson = SCALE_LESSONS.find((l) => l.exercise === EXERCISE.KEY);
+  const allowed = [...scalePitchSet(lesson)];
+  let summary = null;
+  const session = new Session(scaleSessionConfig(lesson, { notesNeeded: 6 }), { onEnd: (s) => (summary = s) });
+  session.start();
+
+  // Cycle the scale so every note gets used and none repeats back to back.
+  for (let i = 0; i < 8; i++) {
+    const midi = 60 + allowed[i % allowed.length];
+    session.judge(midi, { midiFloat: midi });
+  }
+  await sleep(900);
+
+  assert.ok(summary, 'stay-in-key must be able to finish');
+  assert.ok(Number.isFinite(summary.mastery));
+  session.stop();
+  store.resetAll();
+});
+
+test('a run demands the right octave, so the last note cannot restart it', async () => {
+  store.resetAll();
+  store.setSetting('countIn', false);
+  store.setSetting('sound', false);
+
+  // The A minor pentatonic octave run ends on A and the next run opens on A,
+  // an octave lower. The high one must not answer for the low one.
+  const lesson = SCALE_LESSONS[0];
+  const steps = runSteps(lesson);
+  const first = steps[0];
+  const last = steps[steps.length - 1];
+  assert.equal(pitchClass(first.midi), pitchClass(last.midi), 'this run really does start and end on the same note name');
+  assert.notEqual(first.midi, last.midi, 'but an octave apart');
+
+  const session = new Session(scaleSessionConfig(lesson, { prompts: 2 }), {});
+  session.start();
+  session.judge(last.midi, { midiFloat: last.midi });
+  assert.equal(session.prompt.stepIndex, 0, 'the wrong octave must not advance the run');
+  session.judge(first.midi, { midiFloat: first.midi });
+  assert.equal(session.prompt.stepIndex, 1, 'the right octave does');
+  session.stop();
+  store.resetAll();
+});
+
+test('a note still ringing when our own chime ends is not heard as a new pluck', () => {
+  const engine = new PitchEngine();
+  engine.setGate(0.01);
+  engine.disarm(57); // a note was judged and is ringing on
+  engine.suppress(300);
+
+  // Frames during suppression: the envelope decays while we make our own noise.
+  const ringing = 0.2;
+  engine.wasSuppressed = true;
+  engine.env = 0.004; // decayed far below the note that is actually sounding
+
+  // The first frame after suppression must re-seed rather than cry attack.
+  const envBefore = engine.env;
+  const justResumed = true;
+  const attack = !justResumed && ringing > engine.gate && ringing > Math.max(envBefore * 1.6, engine.gate * 1.2);
+  assert.equal(attack, false, 'a decayed envelope must not turn a sustained note into an attack');
+});
+
 /* ---------- accounts and cloud saves ---------------------------------- */
 
 test('usernames are normalised and checked the same way the database does it', () => {

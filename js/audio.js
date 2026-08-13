@@ -70,6 +70,7 @@ export class PitchEngine {
     this.armed = true;
     this.armReference = null; // pitch of the last judged note, if it may still ring
     this.suppressedUntil = 0;
+    this.wasSuppressed = false;
     this.history = [];
     this.lastFrame = null;
     this.error = null;
@@ -203,14 +204,21 @@ export class PitchEngine {
     this.analyser.getFloatTimeDomainData(this.raw);
     const rms = computeRms(this.raw);
     const suppressed = performance.now() < this.suppressedUntil;
+    // The first frame after our own noise stops: the envelope has been decaying
+    // and no longer describes the room, so a string that was already ringing
+    // would look like a fresh pluck. Re-seed from reality and skip one attack.
+    const justResumed = this.wasSuppressed && !suppressed;
+    this.wasSuppressed = suppressed;
+
     const envBefore = this.env;
     // While the app is making noise, let the envelope decay rather than
     // tracking our own beep — otherwise the next real pluck looks quiet.
-    if (!suppressed) this.env = Math.max(rms, this.env * 0.92);
-    else this.env = this.env * 0.92;
+    if (suppressed) this.env = this.env * 0.92;
+    else if (justResumed) this.env = Math.max(this.env, rms);
+    else this.env = Math.max(rms, this.env * 0.92);
 
     // A fresh attack, or a released string, makes the engine listen again.
-    const attack = !suppressed && rms > this.gate && rms > Math.max(envBefore * 1.6, this.gate * 1.2);
+    const attack = !suppressed && !justResumed && rms > this.gate && rms > Math.max(envBefore * 1.6, this.gate * 1.2);
     const released = !suppressed && rms < this.gate * 0.8;
     if (!this.armed && (attack || released)) {
       this.armed = true;

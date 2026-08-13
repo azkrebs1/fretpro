@@ -159,6 +159,12 @@ Each unit takes one shape and works it four ways:
 Order: A minor pentatonic box 1, then box 2, then the same shape moved to E, G and D,
 then major pentatonic, the blues scale, and the major scale in three-notes-per-string.
 
+The Drill tab has a **scale drill** for free practice: any scale, any of the twelve
+roots, any shape, any of the four exercises, with its own clock. Shapes that would run
+off the end of the neck in the chosen key are marked and cannot be picked. Nothing
+there unlocks lessons, but the notes still feed your fretboard schedule. Both drill
+builders have their own clock slider, independent of the one in Setup.
+
 **Shapes are generated, not typed in.** A box is one unbroken climb through the scale:
 each string picks up at the next scale tone above where the previous string stopped.
 That is the actual definition of both the CAGED boxes and the three-notes-per-string

@@ -9,7 +9,7 @@ import { createFretboard, noteBadge } from './fretboard.js';
 import { Session, effectiveTimer } from './session.js';
 import * as cloud from './cloud.js';
 import { supabaseConfig, writeOverride } from './config.js';
-import { boxPositions, boxWindow, scaleTitle, SCALES, SCALE_MAX_FRET } from './scales.js';
+import { boxPositions, boxWindow, boxCount, boxFits, scaleTitle, rootName, SCALES, SCALE_MAX_FRET } from './scales.js';
 import {
   SCALE_UNITS,
   SCALE_LESSONS,
@@ -1243,8 +1243,13 @@ function renderResults(summary, config) {
 
   if (summary.leveledTo && s.sound) playLevelUp();
 
-  const lesson = summary.lessonId ? LESSON_BY_ID.get(summary.lessonId) : null;
-  const nextLesson = lesson ? LESSONS[lesson.index + 1] : null;
+  // Results are shared by both tracks, so look the lesson up in the right one.
+  const onScaleTrack = Boolean(config.scaleLessonId);
+  const lesson = summary.lessonId
+    ? (onScaleTrack ? SCALE_LESSON_BY_ID.get(summary.lessonId) : LESSON_BY_ID.get(summary.lessonId))
+    : null;
+  const nextLesson = lesson ? (onScaleTrack ? SCALE_LESSONS[lesson.index + 1] : LESSONS[lesson.index + 1]) : null;
+  const nextTitle = nextLesson ? (onScaleTrack ? nextLesson.title : lessonTitle(nextLesson)) : null;
 
   root.appendChild(
     h('div', {}, [
@@ -1280,7 +1285,7 @@ function renderResults(summary, config) {
         h('b', { text: summary.leveledTo ? `Unlocked level ${summary.leveledTo}` : passed ? 'Level held' : `Needed ${pct(summary.requiredAccuracy)} to level up` }),
         summary.leveledTo
           ? nextLesson
-            ? `Next stop: ${lessonTitle(nextLesson)}.`
+            ? `Next stop: ${nextTitle}.`
             : 'That is the end of the path — keep reviewing to hold it.'
           : passed
           ? 'Run it again to push the level higher.'
@@ -1289,13 +1294,13 @@ function renderResults(summary, config) {
     );
   }
 
-  if (summary.trouble.length) {
+  if (summary.trouble.some((t) => t.note)) {
     root.appendChild(h('div', { class: 'eyebrow', style: 'margin-top:18px', text: 'Notes that fought back' }));
     root.appendChild(
       h(
         'div',
         { class: 'badge-row' },
-        summary.trouble.map((t) => noteBadge(s.tuning, t.note.string, t.note.fret, s.spelling))
+        summary.trouble.filter((t) => t.note).map((t) => noteBadge(s.tuning, t.note.string, t.note.fret, s.spelling))
       )
     );
   }
@@ -1303,8 +1308,11 @@ function renderResults(summary, config) {
   root.appendChild(
     h('div', { class: 'btn-row', style: 'margin-top:24px' }, [
       h('button', { class: 'btn is-primary', onclick: () => beginSession({ ...config }) }, ['Run it again']),
-      nextLesson && summary.leveledTo && lessonState(nextLesson) !== 'locked'
-        ? h('button', { class: 'btn', onclick: () => startLesson(nextLesson.id) }, ['Next lesson'])
+      nextLesson && summary.leveledTo && (onScaleTrack ? scaleLessonState(nextLesson) !== 'locked' : lessonState(nextLesson) !== 'locked')
+        ? h('button', {
+            class: 'btn',
+            onclick: () => (onScaleTrack ? startScaleLesson(nextLesson.id) : startLesson(nextLesson.id)),
+          }, ['Next lesson'])
         : null,
       h('button', {
         class: 'btn is-ghost',
@@ -1513,6 +1521,9 @@ export function renderDrill() {
   const maxFret = h('input', { type: 'number', min: '0', max: String(MAX_FRET), value: '12', style: 'max-width:100px' });
   const naturalsOnly = h('input', { type: 'checkbox', checked: true });
   const promptCount = h('input', { type: 'number', min: '5', max: '60', value: '20', style: 'max-width:100px' });
+  const customClock = clockSlider(s.timerSeconds);
+
+  root.appendChild(scaleDrillPanel());
 
   root.appendChild(
     h('div', { class: 'panel', style: 'margin-top:22px' }, [
@@ -1532,6 +1543,7 @@ export function renderDrill() {
             h('label', { class: 'switch' }, [naturalsOnly, 'Natural notes only (no sharps or flats)']),
           ]),
           h('div', { class: 'field' }, [h('label', { text: 'Prompts' }), promptCount]),
+          customClock.field,
         ]),
       ]),
       h('div', { class: 'btn-row' }, [
@@ -1558,7 +1570,7 @@ export function renderDrill() {
                 pool,
                 prompts: clamp(Number(promptCount.value) || 20, 5, 60),
                 title: `Drill · ${strings.length} string${strings.length > 1 ? 's' : ''}, frets ${lo}–${hi}`,
-                timerSeconds: s.timerSeconds,
+                timerSeconds: customClock.seconds(),
                 inputMode: s.inputMode,
                 promptStyle: s.promptStyle,
               });
@@ -1569,6 +1581,149 @@ export function renderDrill() {
       ]),
     ])
   );
+}
+
+/** A labelled clock slider. Returns the element plus a live value getter. */
+function clockSlider(initialSeconds, label = 'Time per note') {
+  const value = h('b', { text: initialSeconds ? `${initialSeconds}s` : 'no clock', style: 'font-family:var(--font-mono)' });
+  const input = h('input', {
+    type: 'range',
+    min: '0',
+    max: '60',
+    step: '1',
+    value: String(initialSeconds),
+    oninput: (e) => {
+      const v = Number(e.target.value);
+      value.textContent = v ? `${v}s` : 'no clock';
+    },
+  });
+  const field = h('div', { class: 'field' }, [
+    h('label', {}, [`${label} · `, value]),
+    input,
+    h('div', { class: 'help', text: 'Slide to zero to practise with no clock at all.' }),
+  ]);
+  return { field, seconds: () => Number(input.value) };
+}
+
+/** Free scale practice — any shape, any key, no effect on the scales path. */
+function startScaleDrill({ scaleId, rootPc, boxIndex, exercise, direction, octaveOnly, seconds, prompts }) {
+  const s = store.settings();
+  const pseudo = { scaleId, rootPc, boxIndex, exercise, direction, octaveOnly };
+  const positions = boxPositions(scaleId, rootPc, boxIndex);
+  if (!positions.length) {
+    toast('That shape does not fit on the neck. Try a lower root or box.', 'bad');
+    return;
+  }
+
+  const config = {
+    exercise,
+    title: `Drill · ${scaleTitle(scaleId, rootPc, s.spelling)} box ${boxIndex + 1}`,
+    prompts,
+    timerSeconds: seconds,
+    inputMode: s.inputMode,
+    promptStyle: 'name',
+    boxPositions: positions,
+    scaleId,
+    rootPc,
+    restartOnError: false,
+  };
+
+  if (exercise === EXERCISE.RUN) config.steps = runSteps(pseudo);
+  else if (exercise === EXERCISE.KEY) {
+    config.allowedPcs = scalePitchSet(pseudo);
+    config.notesNeeded = 12;
+  } else config.pool = lessonPositions(pseudo);
+
+  if (config.steps && config.steps.length < 2) {
+    toast('That shape came out too short to run.', 'bad');
+    return;
+  }
+  beginSession(config);
+}
+
+/** Scale drill builder: any shape, any key, any of the four exercises. */
+function scaleDrillPanel() {
+  const s = store.settings();
+  const scaleIds = Object.keys(SCALES);
+  const roots = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+
+  const scaleSel = select(scaleIds.map((id) => [id, SCALES[id].name]), 'minorPentatonic', () => syncBoxes());
+  const rootSel = select(roots.map((pc) => [String(pc), rootName(pc, s.spelling)]), '9', () => syncBoxes());
+  const boxSel = h('select', {});
+  const exerciseSel = select(
+    [
+      ['run-up', 'Run — ascending'],
+      ['run-down', 'Run — descending'],
+      ['run-oct', 'Run — one octave'],
+      [EXERCISE.ROOT, 'Find the roots'],
+      [EXERCISE.DEGREE, 'Name the degrees'],
+      [EXERCISE.KEY, 'Stay in key'],
+    ],
+    'run-up',
+    () => {}
+  );
+  const rounds = h('input', { type: 'number', min: '1', max: '30', value: '4', style: 'max-width:100px' });
+  const clock = clockSlider(20, 'Clock per round');
+  const fitNote = h('div', { class: 'help' });
+
+  function syncBoxes() {
+    const scaleId = scaleSel.value;
+    const rootPc = Number(rootSel.value);
+    const count = boxCount(SCALES[scaleId]);
+    const previous = Number(boxSel.value) || 0;
+    boxSel.textContent = '';
+    let fits = 0;
+    for (let i = 0; i < count; i++) {
+      const ok = boxFits(scaleId, rootPc, i);
+      if (ok) fits += 1;
+      boxSel.appendChild(
+        h('option', { value: String(i), selected: i === previous && ok, disabled: !ok, text: ok ? `Box ${i + 1}` : `Box ${i + 1} — runs off the neck` })
+      );
+    }
+    fitNote.textContent = `${fits} of ${count} shapes fit on the neck in ${rootName(rootPc, s.spelling)}. Higher roots push the upper boxes past the last fret.`;
+  }
+  syncBoxes();
+
+  return h('div', { class: 'panel', style: 'margin-top:22px' }, [
+    h('div', { class: 'eyebrow', text: 'Free scale practice' }),
+    h('h2', { text: 'Scale drill', style: 'margin:6px 0 4px' }),
+    h('p', { class: 'help', style: 'margin-bottom:16px', text: 'Any shape in any key, outside the scales path. Nothing here unlocks lessons, but every note still feeds your fretboard schedule.' }),
+    h('div', { class: 'cols' }, [
+      h('div', {}, [
+        h('div', { class: 'field' }, [h('label', { text: 'Scale' }), scaleSel]),
+        h('div', { class: 'field' }, [h('label', { text: 'Root' }), rootSel]),
+        h('div', { class: 'field' }, [h('label', { text: 'Shape' }), boxSel, fitNote]),
+      ]),
+      h('div', {}, [
+        h('div', { class: 'field' }, [h('label', { text: 'Exercise' }), exerciseSel]),
+        h('div', { class: 'field' }, [h('label', { text: 'Rounds' }), rounds]),
+        clock.field,
+      ]),
+    ]),
+    h('div', { class: 'btn-row' }, [
+      h(
+        'button',
+        {
+          class: 'btn is-primary',
+          onclick: () => {
+            const choice = exerciseSel.value;
+            const isRun = choice.startsWith('run');
+            startScaleDrill({
+              scaleId: scaleSel.value,
+              rootPc: Number(rootSel.value),
+              boxIndex: Number(boxSel.value) || 0,
+              exercise: isRun ? EXERCISE.RUN : choice,
+              direction: choice === 'run-down' ? 'down' : 'up',
+              octaveOnly: choice === 'run-oct',
+              seconds: clock.seconds(),
+              prompts: clamp(Number(rounds.value) || 4, 1, 30),
+            });
+          },
+        },
+        ['Start scale drill']
+      ),
+    ]),
+  ]);
 }
 
 function drillCard(title, stat, blurb, onclick, disabled = false) {

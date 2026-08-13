@@ -330,7 +330,10 @@ export class Session {
   #judgeRunStep(playedMidi, playedFloat, meta) {
     const prompt = this.prompt;
     const step = prompt.steps[prompt.stepIndex];
-    const ok = matchesTarget(playedFloat, step.midi, { strict: false, toleranceCents: this.settings.pitchTolerance });
+    // A run is about hitting specific positions, so the octave has to be right.
+    // It also stops a run that ends on A from being restarted by that same A
+    // ringing on into the next run's opening note.
+    const ok = matchesTarget(playedFloat, step.midi, { strict: true, toleranceCents: this.settings.pitchTolerance });
 
     if (this.engine) this.engine.disarm(playedFloat);
 
@@ -571,7 +574,7 @@ export class Session {
       results: this.results,
       durationMs: Date.now() - this.startedAt,
       at: Date.now(),
-      mastery: this.config.pool.reduce((acc, n) => acc + mastery(store.noteRecord(posKey(n.string, n.fret))), 0) / this.config.pool.length,
+      mastery: poolMastery(this.config),
     };
 
     store.pushHistory({
@@ -586,6 +589,21 @@ export class Session {
     store.saveNow();
     return summary;
   }
+}
+
+/**
+ * Average mastery of whatever the session covered. A run or stay-in-key session
+ * has no `pool` — it works from a shape — so fall back to that rather than
+ * throwing on the last note and killing the session before it can finish.
+ */
+function poolMastery(config) {
+  const positions = config.pool || config.boxPositions || config.steps || [];
+  if (!positions.length) return 0;
+  const seen = new Map();
+  for (const n of positions) seen.set(posKey(n.string, n.fret), n);
+  let total = 0;
+  for (const key of seen.keys()) total += mastery(store.noteRecord(key));
+  return total / seen.size;
 }
 
 /** Effective clock for a lesson attempt, honouring the per-level tightening. */
