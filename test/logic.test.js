@@ -907,6 +907,184 @@ test('a ringing note cannot answer the next prompt, but a new note can', async (
   session.stop();
 });
 
+/* ---------- sequences and guided runs --------------------------------- */
+
+const SEQ_POOL = [
+  { string: 6, fret: 0 },
+  { string: 6, fret: 3 },
+  { string: 6, fret: 5 },
+  { string: 5, fret: 2 },
+  { string: 5, fret: 5 },
+];
+
+function drillConfig(overrides = {}) {
+  return {
+    pool: SEQ_POOL,
+    prompts: 1,
+    title: 'test drill',
+    timerSeconds: 0,
+    inputMode: 'tap',
+    promptStyle: 'name',
+    ...overrides,
+  };
+}
+
+test('a slot of several notes comes out as an ordered run of that length', () => {
+  store.resetAll();
+  store.setSetting('countIn', false);
+  store.setSetting('sound', false);
+
+  const session = new Session(drillConfig({ sequenceLength: 4 }), {});
+  session.start();
+
+  const prompt = session.prompt;
+  assert.equal(prompt.kind, 'run');
+  assert.equal(prompt.steps.length, 4);
+  assert.equal(prompt.stepIndex, 0);
+  for (const step of prompt.steps) {
+    assert.equal(step.midi, midiAt('standard', step.string, step.fret));
+    assert.ok(SEQ_POOL.some((n) => n.string === step.string && n.fret === step.fret), 'every step comes from the pool');
+  }
+  session.stop();
+  store.resetAll();
+});
+
+test('a slot never asks for the same note name twice running', () => {
+  store.resetAll();
+  store.setSetting('countIn', false);
+  store.setSetting('sound', false);
+
+  // Enough draws that a repeat would show up if nothing prevented it.
+  for (let round = 0; round < 40; round++) {
+    const session = new Session(drillConfig({ sequenceLength: 6 }), {});
+    session.start();
+    const steps = session.prompt.steps;
+    for (let i = 1; i < steps.length; i++) {
+      assert.notEqual(
+        pitchClass(steps[i].midi),
+        pitchClass(steps[i - 1].midi),
+        'a note still ringing must not be able to answer for the next one'
+      );
+    }
+    session.stop();
+  }
+  store.resetAll();
+});
+
+test('a sequence is finished by playing its notes in order, and grades every one', async () => {
+  store.resetAll();
+  store.setSetting('countIn', false);
+  store.setSetting('sound', false);
+
+  let summary = null;
+  const session = new Session(drillConfig({ sequenceLength: 3 }), { onEnd: (s) => (summary = s) });
+  session.start();
+  const steps = [...session.prompt.steps];
+
+  for (const step of steps) session.judge(step.midi, { midiFloat: step.midi });
+  await sleep(900);
+
+  assert.ok(summary, 'the last note of the last slot must end the session');
+  assert.equal(summary.prompts, 1);
+  assert.equal(summary.correct, 1, 'a clean slot counts as one first-try answer');
+  for (const step of steps) {
+    assert.ok(store.noteRecord(posKey(step.string, step.fret)), 'every note of the slot feeds the schedule');
+  }
+  session.stop();
+  store.resetAll();
+});
+
+test('a wrong note holds the sequence on the step it is on', () => {
+  store.resetAll();
+  store.setSetting('countIn', false);
+  store.setSetting('sound', false);
+
+  const session = new Session(drillConfig({ sequenceLength: 3 }), {});
+  session.start();
+  const first = session.prompt.steps[0];
+
+  session.judge(first.midi + 1, { midiFloat: first.midi + 1 });
+  assert.equal(session.prompt.stepIndex, 0, 'a wrong note waits, it does not advance');
+  session.judge(first.midi, { midiFloat: first.midi });
+  assert.equal(session.prompt.stepIndex, 1);
+  session.stop();
+  store.resetAll();
+});
+
+test('a drill sequence follows the octave setting, unlike a scale run', () => {
+  store.resetAll();
+  store.setSetting('countIn', false);
+  store.setSetting('sound', false);
+
+  store.setSetting('octaveStrictness', 'lenient');
+  const lenient = new Session(drillConfig({ sequenceLength: 2 }), {});
+  lenient.start();
+  const target = lenient.prompt.steps[0].midi;
+  lenient.judge(target + 12, { midiFloat: target + 12 });
+  assert.equal(lenient.prompt.stepIndex, 1, 'the right note an octave up counts when lenient');
+  lenient.stop();
+
+  store.setSetting('octaveStrictness', 'strict');
+  const strict = new Session(drillConfig({ sequenceLength: 2 }), {});
+  strict.start();
+  const exact = strict.prompt.steps[0].midi;
+  strict.judge(exact + 12, { midiFloat: exact + 12 });
+  assert.equal(strict.prompt.stepIndex, 0, 'and does not when the setting says exact string');
+  strict.stop();
+
+  store.setSetting('octaveStrictness', 'lenient');
+  store.resetAll();
+});
+
+test('a guided run moves on by itself and judges nothing', async () => {
+  store.resetAll();
+  store.setSetting('countIn', false);
+  store.setSetting('sound', false);
+
+  let summary = null;
+  const session = new Session(
+    drillConfig({ prompts: 2, sequenceLength: 2, timerSeconds: 0.3, guided: true }),
+    { onEnd: (s) => (summary = s) }
+  );
+  session.start();
+
+  // Nothing that arrives while a guided slot is up may be judged.
+  const step = session.prompt.steps[0];
+  session.judge(step.midi, { midiFloat: step.midi });
+  session.judge(step.midi + 7, { midiFloat: step.midi + 7 });
+  assert.equal(session.results.length, 0, 'a guided run has no answers to record');
+
+  await sleep(900);
+
+  assert.ok(summary, 'the clock alone must be able to finish a guided run');
+  assert.equal(summary.guided, true);
+  assert.equal(summary.slots, 2);
+  assert.equal(summary.notesShown, 4);
+  assert.equal(store.stats().xp, 0, 'no XP for a run nobody listened to');
+  assert.equal(store.stats().history.length, 0, 'and nothing in the history');
+  assert.equal(Object.keys(store.allNoteRecords()).length, 0, 'and not one note rescheduled');
+  session.stop();
+  store.resetAll();
+});
+
+test('a guided slot walks its own notes as the clock runs down', async () => {
+  store.resetAll();
+  store.setSetting('countIn', false);
+  store.setSetting('sound', false);
+
+  const seen = [];
+  const session = new Session(drillConfig({ prompts: 1, sequenceLength: 3, timerSeconds: 0.6, guided: true }), {
+    onAdvance: (prompt) => seen.push(prompt.stepIndex),
+  });
+  session.start();
+  assert.equal(session.prompt.stepIndex, 0, 'it opens on the first note');
+
+  await sleep(500);
+  assert.deepEqual(seen, [1, 2], 'the slot is cut into one share per note');
+  session.stop();
+  store.resetAll();
+});
+
 test('an unsettled frame is ignored even when the mic is open', async () => {
   store.resetAll();
   store.setSetting('countIn', false);

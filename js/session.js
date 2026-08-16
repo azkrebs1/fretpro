@@ -13,6 +13,11 @@ import { playCorrect, playWrong, playStep } from './audio.js';
 const REVEAL_MS = 1500;
 const CORRECT_HOLD_MS = 520;
 
+export const MAX_SEQUENCE = 10;
+
+/** A guided session with no clock would never advance, so it gets one anyway. */
+const GUIDED_FALLBACK_SECONDS = 4;
+
 export class Session {
   /**
    * @param {object} config
@@ -21,9 +26,15 @@ export class Session {
    * @param {string} config.title shown in the session header
    * @param {string} [config.lessonId] set for path lessons; omitted for free drills
    * @param {number} [config.targetLevel]
-   * @param {number} config.timerSeconds 0 disables the clock
+   * @param {number} config.timerSeconds 0 disables the clock; with a sequence
+   *   it is the length of the whole slot, not of one note
    * @param {'mic'|'tap'} config.inputMode
    * @param {'name'|'position'|'mixed'} config.promptStyle
+   * @param {number} [config.sequenceLength] notes per slot, 1-10. Above 1 each
+   *   prompt is an ordered run of freshly drawn notes.
+   * @param {boolean} [config.guided] show the notes and move on by the clock:
+   *   nothing is listened to, judged, scored or recorded
+   * @param {boolean} [config.countIn] override the count-in setting
    */
   constructor(config, handlers = {}) {
     this.config = config;
@@ -42,10 +53,29 @@ export class Session {
     this.unsubscribe = null;
     this.wrongThisPrompt = [];
     this.finished = false;
+    this.slotsShown = 0; // guided only: slots that have run their course
+    this.notesShown = 0;
   }
 
   get total() {
     return this.config.prompts;
+  }
+
+  /** Notes asked for in one slot. Scale exercises bring their own steps. */
+  get sequenceLength() {
+    const n = Math.round(Number(this.config.sequenceLength) || 1);
+    return Math.max(1, Math.min(MAX_SEQUENCE, n));
+  }
+
+  get guided() {
+    return Boolean(this.config.guided);
+  }
+
+  /** Seconds per slot, with a floor so a guided session cannot stall. */
+  get slotSeconds() {
+    const seconds = this.config.timerSeconds;
+    if (seconds) return seconds;
+    return this.guided ? GUIDED_FALLBACK_SECONDS : 0;
   }
 
   get answered() {
@@ -71,7 +101,8 @@ export class Session {
 
   start() {
     this.startedAt = Date.now();
-    if (this.settings.countIn) {
+    const countIn = this.config.countIn != null ? this.config.countIn : this.settings.countIn;
+    if (countIn) {
       this.state = 'countIn';
       let n = 3;
       this.handlers.onCountIn?.(n);
@@ -117,6 +148,8 @@ export class Session {
 
     if (this.config.exercise && this.config.exercise !== 'note') {
       this.prompt = this.#buildScalePrompt(this.index);
+    } else if (this.sequenceLength > 1) {
+      this.prompt = this.#buildSequencePrompt(this.index);
     } else {
       const note = pickNext(this.config.pool, (k) => this.#record(k), this.lastKey);
       const midi = midiAt(this.settings.tuning, note.string, note.fret);
@@ -140,8 +173,10 @@ export class Session {
       };
     }
 
-    this.lastKey = this.prompt.key;
-    this.state = 'awaiting';
+    // A sequence ends on its last note, and that is what the next slot must
+    // avoid repeating.
+    this.lastKey = this.prompt.tailKey || this.prompt.key;
+    this.state = this.guided ? 'showing' : 'awaiting';
     // Do NOT force-arm here. A guitar note rings for seconds, so the note you
     // just played would otherwise be picked up as the answer to this prompt.
     // The engine re-arms itself on silence, a fresh attack, or a new pitch.
@@ -153,7 +188,7 @@ export class Session {
   }
 
   #startClock() {
-    const seconds = this.config.timerSeconds;
+    const seconds = this.slotSeconds;
     if (!seconds) {
       this.handlers.onTick?.(null, null);
       return;
@@ -162,6 +197,7 @@ export class Session {
     const tick = () => {
       const remaining = Math.max(0, this.deadline - performance.now());
       this.handlers.onTick?.(remaining / 1000, remaining / (seconds * 1000));
+      if (this.guided) this.#advanceGuided(1 - remaining / (seconds * 1000));
       if (remaining <= 0) {
         clearInterval(this.tickId);
         this.#timeout();
@@ -169,6 +205,29 @@ export class Session {
     };
     tick();
     this.tickId = setInterval(tick, 50);
+  }
+
+  /**
+   * Guided sessions have nothing to judge, so the notes of a slot are walked by
+   * the clock itself: the slot is cut into equal shares, one per note. Reading
+   * the step back off the deadline rather than running a second timer keeps it
+   * from drifting away from the clock — and from the metronome.
+   * @param {number} elapsed 0-1 through the slot
+   */
+  #advanceGuided(elapsed) {
+    const prompt = this.prompt;
+    if (!prompt || !prompt.steps || prompt.steps.length < 2) return;
+    const index = Math.min(prompt.steps.length - 1, Math.floor(elapsed * prompt.steps.length));
+    if (index <= prompt.stepIndex) return;
+    prompt.stepIndex = index;
+    const step = prompt.steps[index];
+    prompt.note = step;
+    prompt.midi = step.midi;
+    prompt.name = noteName(step.midi, this.settings.spelling);
+    prompt.key = posKey(step.string, step.fret);
+    prompt.stepShownAt = performance.now();
+    if (this.settings.sound && !this.config.metronome) playStep();
+    this.handlers.onAdvance?.(prompt, this);
   }
 
   /**
@@ -235,6 +294,53 @@ export class Session {
     };
   }
 
+  /**
+   * A slot of ordered notes drawn fresh from the pool — "play A, E, G, in that
+   * order, before the clock runs out". It rides on the same machinery as a
+   * scale run, but the notes come from the schedule rather than from a shape.
+   */
+  #buildSequencePrompt(number) {
+    const shownAt = performance.now();
+    const steps = [];
+    let lastKey = this.lastKey;
+    for (let i = 0; i < this.sequenceLength; i++) {
+      const previous = steps[steps.length - 1];
+      let note = null;
+      let midi = null;
+      // Two notes of the same name back to back cannot be told apart while the
+      // first one is still ringing, so redraw a few times before giving in.
+      for (let attempt = 0; attempt < 8; attempt++) {
+        note = pickNext(this.config.pool, (k) => this.#record(k), lastKey);
+        midi = midiAt(this.settings.tuning, note.string, note.fret);
+        if (!previous || pitchClass(midi) !== pitchClass(previous.midi)) break;
+      }
+      steps.push({ string: note.string, fret: note.fret, midi });
+      lastKey = posKey(note.string, note.fret);
+    }
+
+    const first = steps[0];
+    return {
+      kind: 'run',
+      steps,
+      stepIndex: 0,
+      note: first,
+      midi: first.midi,
+      pc: pitchClass(first.midi),
+      name: noteName(first.midi, this.settings.spelling),
+      key: posKey(first.string, first.fret),
+      tailKey: lastKey,
+      // A sequence is judged the way its single notes are, so a right note in
+      // the wrong octave still counts unless the setting says otherwise.
+      strictOctave: this.settings.octaveStrictness === 'strict',
+      style: 'sequence',
+      number,
+      shownAt,
+      stepShownAt: shownAt,
+      cleanSteps: 0,
+      stepErrorsSeen: 0,
+    };
+  }
+
   #onFrame(frame) {
     if (this.state !== 'awaiting' && this.state !== 'wrong') return;
     // The engine already applies the clarity and steadiness bar for the chosen
@@ -250,6 +356,7 @@ export class Session {
    *   from the microphone; a tap has no detuning, so it falls back to the integer.
    */
   judge(playedMidi, meta = {}) {
+    if (this.guided) return; // nothing is being listened to, so nothing is judged
     if (this.state !== 'awaiting' && this.state !== 'wrong') return;
     const playedFloat = meta.midiFloat != null ? meta.midiFloat : playedMidi;
 
@@ -330,10 +437,12 @@ export class Session {
   #judgeRunStep(playedMidi, playedFloat, meta) {
     const prompt = this.prompt;
     const step = prompt.steps[prompt.stepIndex];
-    // A run is about hitting specific positions, so the octave has to be right.
-    // It also stops a run that ends on A from being restarted by that same A
-    // ringing on into the next run's opening note.
-    const ok = matchesTarget(playedFloat, step.midi, { strict: true, toleranceCents: this.settings.pitchTolerance });
+    // A scale run is about hitting specific positions, so the octave has to be
+    // right. It also stops a run that ends on A from being restarted by that
+    // same A ringing on into the next run's opening note. A drill sequence
+    // follows the octave setting instead, like the single notes it is made of.
+    const strict = prompt.strictOctave !== false;
+    const ok = matchesTarget(playedFloat, step.midi, { strict, toleranceCents: this.settings.pitchTolerance });
 
     if (this.engine) this.engine.disarm(playedFloat);
 
@@ -468,8 +577,19 @@ export class Session {
 
   #timeout() {
     if (this.state === 'correct' || this.state === 'revealed' || this.state === 'done') return;
-    this.state = 'revealed';
     clearInterval(this.tickId);
+
+    // A guided slot is not missed when it ends — it is simply over. Nothing is
+    // recorded against the notes and nothing counts against you.
+    if (this.guided) {
+      this.slotsShown += 1;
+      this.notesShown += this.prompt && this.prompt.steps ? this.prompt.steps.length : 1;
+      this.handlers.onJudged?.({ verdict: 'advance' }, this);
+      this.#nextPrompt();
+      return;
+    }
+
+    this.state = 'revealed';
     if (this.engine) this.engine.disarm(this.prompt.midi);
     if (this.settings.sound) playWrong();
 
@@ -512,6 +632,23 @@ export class Session {
   }
 
   #buildSummary() {
+    // A guided session judged nothing, so it claims nothing: no XP, no
+    // accuracy, no history, and not one note's schedule touched.
+    if (this.guided) {
+      return {
+        guided: true,
+        title: this.config.title,
+        lessonId: null,
+        slots: this.slotsShown,
+        notesShown: this.notesShown,
+        sequenceLength: this.sequenceLength,
+        secondsPerSlot: this.slotSeconds,
+        bpm: this.config.metronome ? this.config.metronome.bpm : null,
+        durationMs: Date.now() - this.startedAt,
+        at: Date.now(),
+      };
+    }
+
     const correctResults = this.results.filter((r) => r.correct);
     const avgMs = correctResults.length
       ? Math.round(correctResults.reduce((a, r) => a + r.ms, 0) / correctResults.length)

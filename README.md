@@ -165,6 +165,32 @@ off the end of the neck in the chosen key are marked and cannot be picked. Nothi
 there unlocks lessons, but the notes still feed your fretboard schedule. Both drill
 builders have their own clock slider, independent of the one in Setup.
 
+## The custom drill
+
+Pick the strings, the fret range and whether sharps count, then choose how it is paced.
+
+**Notes per slot**, 1 to 10. At 1 it is the ordinary drill: one note, one clock. Above
+that, each slot is a short run — *A, then E, then G* — to be played in that order
+inside the one clock, with the sequence spelled out above the neck and the current note
+lit. A wrong note waits for you rather than skipping ahead, and each position in the
+slot is scheduled on its own, so a run of five feeds five notes' worth of practice.
+Two notes of the same name never land back to back, because the first would still be
+ringing when the second was wanted.
+
+**The metronome** clicks the beat and takes the clock over: set the tempo and how many
+beats each note gets, and a slot lasts exactly as long as its notes need. One bar of
+clicks counts you in and the first slot starts on the downbeat. Both click pitches sit
+above the range the pitch detector listens in, and unlike the app's other sounds a
+click does not deafen the microphone — so it can tick all the way through a session
+without ever answering for you. The clicks are scheduled on the audio clock rather than
+from a timer, which is the difference between a metronome and an approximation.
+
+**Guided run** turns the judging off entirely: no microphone, no tapping, no score. The
+notes simply go by on the clock, one slot at a time, and inside a slot each note gets
+its share. Nothing is graded, no XP is earned, no note moves on its schedule and
+nothing reaches your history — it is for warming up, or for playing along at a tempo.
+The results screen says what it put in front of you and nothing more.
+
 **Shapes are generated, not typed in.** A box is one unbroken climb through the scale:
 each string picks up at the next scale tone above where the previous string stopped.
 That is the actual definition of both the CAGED boxes and the three-notes-per-string
@@ -202,7 +228,7 @@ js/srs.js             spaced repetition and mastery scoring
 js/store.js           persistence, and the two-device merge
 js/config.js          Supabase URL and key
 js/cloud.js           sign-in and sync
-js/audio.js           mic capture, calibration, YIN pitch detection
+js/audio.js           mic capture, calibration, YIN pitch detection, metronome
 js/fretboard.js       SVG board: prompts, tap input, heat map
 js/session.js         the prompt/judge/advance loop
 js/ui.js              screens and wiring
@@ -221,7 +247,10 @@ npm test
 
 Covers the fretboard math, the shape of the path, the scheduling rules, and pitch
 detection against synthesised plucks at all 108 positions — including a weak
-fundamental, a missing fundamental, and a noisy room.
+fundamental, a missing fundamental, and a noisy room. Sequences and guided runs are
+tested against the real session loop: that a slot draws the right notes and never
+repeats a name back to back, that a wrong note holds the run where it is, and that a
+guided run finishes on the clock while touching nothing at all.
 
 ## Notes
 

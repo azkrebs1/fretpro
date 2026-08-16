@@ -47,6 +47,12 @@
   box-sizing: border-box;
 }
 
+/* A laid-out element beats the browser's own [hidden] rule, so say it louder —
+   half the panels here hide rows that are flex or grid. */
+[hidden] {
+  display: none !important;
+}
+
 html,
 body {
   margin: 0;
@@ -699,6 +705,11 @@ p {
   box-shadow: 0 0 8px var(--sapphire-glow);
 }
 
+/* A guided slot that has been. Nothing was judged, so it is neither green nor red. */
+.pips i.is-past {
+  background: var(--ink-faint);
+}
+
 .stage {
   border: 1px solid var(--edge);
   border-radius: var(--r-lg);
@@ -1069,6 +1080,77 @@ p {
 .choice.is-right {
   border-color: var(--green);
   color: var(--green-deep);
+}
+
+/* The notes of one slot, in the order they are wanted. */
+.seq {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: center;
+  margin-top: 18px;
+}
+
+.seq i {
+  min-width: 46px;
+  padding: 8px 10px;
+  border: 1px solid var(--edge);
+  border-radius: var(--r-sm);
+  background: var(--panel);
+  color: var(--ink-faint);
+  font-family: var(--font-display);
+  font-style: normal;
+  font-size: 19px;
+  letter-spacing: 0.04em;
+  text-align: center;
+  transition: color 0.15s ease, border-color 0.15s ease, transform 0.15s ease;
+}
+
+.seq i.is-done {
+  color: var(--green-deep);
+  border-color: var(--green);
+}
+
+/* Guided: a note that has gone by was not "got right", it just went by. */
+.seq.is-guided i.is-done {
+  color: var(--ink-faint);
+  border-color: var(--edge);
+  opacity: 0.55;
+}
+
+.seq i.is-now {
+  color: var(--sapphire-deep);
+  border-color: var(--sapphire);
+  background: var(--sapphire-wash);
+  transform: translateY(-2px);
+  box-shadow: 0 0 0 3px var(--sapphire-glow);
+}
+
+/* One lamp per beat of the bar, lit on the beat it is. */
+.beat-row {
+  display: flex;
+  gap: 5px;
+  justify-content: flex-end;
+  margin-top: 8px;
+}
+
+.beat-row i {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--sunk);
+  border: 1px solid var(--edge);
+  transition: background 0.06s linear, transform 0.06s linear;
+}
+
+.beat-row i.is-on {
+  background: var(--sapphire-bright);
+  border-color: var(--sapphire);
+}
+
+.beat-row i.is-on.is-accent {
+  background: var(--sapphire-deep);
+  transform: scale(1.35);
 }
 
 .run-progress {

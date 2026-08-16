@@ -500,3 +500,105 @@ export function playLevelUp() {
   announceSelfNoise(3 * 90 + 260 + 320);
   [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => playTone(f, 260, { type: 'sine', gain: 0.09 }), i * 90));
 }
+
+/* ---- Metronome ------------------------------------------------------- */
+
+/* Both click pitches sit above FMAX, so YIN cannot hear the metronome as a
+   played note, and — like the run tick — a click never suppresses the
+   microphone. A click on every beat would otherwise deafen the whole session. */
+const CLICK_HZ = 1568;
+const CLICK_ACCENT_HZ = 2349;
+
+function scheduleClick(ctx, at, accent) {
+  try {
+    const osc = ctx.createOscillator();
+    const amp = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.value = accent ? CLICK_ACCENT_HZ : CLICK_HZ;
+    amp.gain.setValueAtTime(0, at);
+    amp.gain.linearRampToValueAtTime(accent ? 0.085 : 0.05, at + 0.004);
+    amp.gain.exponentialRampToValueAtTime(0.0001, at + 0.05);
+    osc.connect(amp).connect(ctx.destination);
+    osc.start(at);
+    osc.stop(at + 0.09);
+  } catch (err) {
+    /* audio is a nicety; never let it break a session */
+  }
+}
+
+export const MIN_BPM = 40;
+export const MAX_BPM = 240;
+
+/**
+ * A steady click, scheduled ahead on the audio clock rather than from
+ * setInterval — a timer that fires a few milliseconds late is inaudible in a
+ * UI and unbearable in a metronome.
+ */
+export class Metronome {
+  /**
+   * @param {object} [opts]
+   * @param {number} [opts.bpm]
+   * @param {number} [opts.beatsPerBar] 0 for no accent
+   * @param {boolean} [opts.sound] false keeps the beat without making noise
+   */
+  constructor({ bpm = 80, beatsPerBar = 4, sound = true } = {}) {
+    this.bpm = Math.max(MIN_BPM, Math.min(MAX_BPM, bpm));
+    this.beatsPerBar = Math.max(0, beatsPerBar);
+    this.sound = sound;
+    this.running = false;
+    this.beat = 0;
+    this.timerId = null;
+    this.nextBeatAt = 0;
+    this.onBeat = null;
+  }
+
+  get beatMs() {
+    return 60000 / this.bpm;
+  }
+
+  /** @param {(beat:{index:number,beatInBar:number,accent:boolean})=>void} onBeat */
+  start(onBeat) {
+    if (this.running) return this;
+    this.onBeat = onBeat || null;
+    this.beat = 0;
+    let ctx;
+    try {
+      ctx = toneContext();
+    } catch (err) {
+      return this; // no audio here; the session still runs on its own clock
+    }
+    this.running = true;
+    // A little grace so the first click is scheduled, not already late.
+    this.nextBeatAt = ctx.currentTime + 0.12;
+    this.#tick();
+    return this;
+  }
+
+  stop() {
+    this.running = false;
+    clearTimeout(this.timerId);
+    this.timerId = null;
+    this.onBeat = null;
+  }
+
+  #tick = () => {
+    if (!this.running) return;
+    const ctx = toneContext();
+    // Schedule everything falling inside the next 150ms, then come back for more.
+    while (this.nextBeatAt < ctx.currentTime + 0.15) {
+      const index = this.beat;
+      const beatInBar = this.beatsPerBar ? index % this.beatsPerBar : 0;
+      const accent = this.beatsPerBar > 0 && beatInBar === 0;
+      if (this.sound) scheduleClick(ctx, this.nextBeatAt, accent);
+      // The visual flash cannot be scheduled on the audio clock, so aim a
+      // plain timer at the same moment.
+      const delayMs = Math.max(0, (this.nextBeatAt - ctx.currentTime) * 1000);
+      setTimeout(() => {
+        if (this.running && this.onBeat) this.onBeat({ index, beatInBar, accent });
+      }, delayMs);
+      this.beat += 1;
+      this.nextBeatAt += 60 / this.bpm;
+    }
+    this.timerId = setTimeout(this.#tick, 25);
+  };
+}

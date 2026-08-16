@@ -4,9 +4,9 @@ import { midiAt, noteName, splitName, posKey, parsePosKey, isNatural, pitchClass
 import { LESSONS, LESSON_BY_ID, UNITS, MAX_LEVEL, levelSpec, ALL_POSITIONS, poolPitchClasses } from './curriculum.js';
 import * as store from './store.js';
 import { mastery, isDue } from './srs.js';
-import { PitchEngine, playNoteTone, playLevelUp, onSelfNoise, SENSITIVITY } from './audio.js';
+import { PitchEngine, playNoteTone, playLevelUp, onSelfNoise, SENSITIVITY, Metronome, MIN_BPM, MAX_BPM } from './audio.js';
 import { createFretboard, noteBadge } from './fretboard.js';
-import { Session, effectiveTimer } from './session.js';
+import { Session, effectiveTimer, MAX_SEQUENCE } from './session.js';
 import * as cloud from './cloud.js';
 import { supabaseConfig, writeOverride } from './config.js';
 import { boxPositions, boxWindow, boxCount, boxFits, scaleTitle, rootName, SCALES, SCALE_MAX_FRET } from './scales.js';
@@ -53,6 +53,7 @@ export const engine = new PitchEngine();
 // for as long as it sounds. Without this the app answers its own prompts.
 onSelfNoise((ms) => engine.suppress(ms));
 let activeSession = null;
+let activeMetronome = null;
 let sessionBoard = null;
 let progressBoard = null;
 let meterUnsub = null;
@@ -602,7 +603,9 @@ export function startReview() {
 }
 
 export function beginSession(config) {
-  if (config.inputMode === 'mic') {
+  // A guided run listens to nothing, so it never opens the microphone or asks
+  // to be calibrated first.
+  if (config.inputMode === 'mic' && !config.guided) {
     const mode = store.settings().calibrateBeforeSession;
     const stale = needsCalibration();
     if (mode === 'always' || (mode === 'auto' && stale)) {
@@ -806,7 +809,10 @@ function runSession(config) {
   const root = $('#screen-session');
   root.textContent = '';
 
-  const micMode = config.inputMode === 'mic';
+  const guided = Boolean(config.guided);
+  // Guided runs show notes and move on by themselves — there is nothing to
+  // listen to and nothing to tap.
+  const micMode = config.inputMode === 'mic' && !guided;
 
   const pips = h(
     'div',
@@ -832,11 +838,17 @@ function runSession(config) {
     levelStrip,
   ]);
 
+  // Metronome, when the drill asked for one: a row of beat lamps, one bar wide.
+  const metroConf = config.metronome && config.metronome.bpm ? config.metronome : null;
+  const beatsPerBar = metroConf ? clamp(metroConf.beatsPerBar || 4, 1, 12) : 0;
+  const beatDots = Array.from({ length: beatsPerBar }, () => h('i'));
+  const beatRow = h('div', { class: 'beat-row', hidden: !metroConf }, beatDots);
+
   const stage = h('div', { class: 'stage' }, [
     h('div', { class: 'ask' }, [
       h('div', { class: 'ask-side ask-left' }, [where]),
       h('div', { class: 'ask-side ask-center' }, [verb, glyphSlot]),
-      h('div', { class: 'ask-side ask-right' }, [h('div', { class: 'eyebrow', text: 'clock' }), clock, clockBar]),
+      h('div', { class: 'ask-side ask-right' }, [h('div', { class: 'eyebrow', text: 'clock' }), clock, clockBar, beatRow]),
     ]),
     verdict,
     micMode ? meter : null,
@@ -844,7 +856,11 @@ function runSession(config) {
 
   const boardHost = h('div', { class: 'board-wrap' });
   const choices = h('div', { class: 'choices' });
-  const hint = h('div', { class: 'hint-line', text: micMode ? 'Play the note on your guitar.' : 'Tap the fret on the board.' });
+  const seqStrip = h('div', { class: guided ? 'seq is-guided' : 'seq', hidden: true });
+  const hint = h('div', {
+    class: 'hint-line',
+    text: guided ? 'Nothing is being listened to — just play along.' : micMode ? 'Play the note on your guitar.' : 'Tap the fret on the board.',
+  });
   const runProgress = h('div', { class: 'run-progress', hidden: true });
 
   const quitBtn = h('button', { class: 'btn is-ghost', onclick: () => confirmQuit() }, ['Quit']);
@@ -858,11 +874,12 @@ function runSession(config) {
       pips,
     ]),
     stage,
+    seqStrip,
     choices,
     runProgress,
     hint,
     boardHost,
-    h('div', { class: 'session-foot' }, [hearBtn, revealBtn, h('div', { class: 'spacer' }), quitBtn])
+    h('div', { class: 'session-foot' }, [hearBtn, guided ? null : revealBtn, h('div', { class: 'spacer' }), quitBtn])
   );
 
   // Board: a scale lesson shows just its shape; a note lesson shows the neck.
@@ -883,7 +900,7 @@ function runSession(config) {
     tuning: s.tuning,
     spelling: s.spelling,
     flip: s.flipBoard,
-    interactive: !micMode,
+    interactive: !micMode && !guided,
   });
 
   showScreen('session');
@@ -895,6 +912,10 @@ function runSession(config) {
       glyphSlot.appendChild(h('div', { class: 'glyph', text: n > 0 ? String(n) : '·' }));
     },
     onPrompt: (prompt) => paintPrompt(prompt),
+    onAdvance: (prompt) => {
+      // A guided slot walking itself from one note to the next.
+      if (prompt.kind === 'run') paintRunBoard(prompt);
+    },
     onTick: (secondsLeft, fraction) => {
       if (secondsLeft == null) {
         clock.textContent = '∞';
@@ -921,9 +942,11 @@ function runSession(config) {
   activeSession = session;
   session.attach(micMode ? engine : null);
 
-  // A run plays notes far faster than a single prompt, so accept each one a
-  // frame sooner. Restored from the user's setting when the session ends.
-  if (micMode && isScale && config.exercise === 'run') {
+  // A run — a scale one or a drill sequence — plays notes far faster than a
+  // single prompt, so accept each one a frame sooner. Restored from the user's
+  // setting when the session ends.
+  const runsNotes = isScale ? config.exercise === 'run' : (config.sequenceLength || 1) > 1;
+  if (micMode && runsNotes) {
     engine.setStableFrames(3);
   }
 
@@ -943,7 +966,7 @@ function runSession(config) {
     });
   }
 
-  if (!micMode) {
+  if (!micMode && !guided) {
     sessionBoard.onTap(({ string, fret }) => {
       if (!activeSession) return;
       if (activeSession.prompt && activeSession.prompt.style === 'position') return; // answer with the buttons
@@ -951,7 +974,27 @@ function runSession(config) {
     });
   }
 
-  session.start();
+  if (metroConf) {
+    // The click is the count-in: one bar of it, then the first slot lands on
+    // the downbeat. The app's own count-in is off in this case, so they do not
+    // talk over each other.
+    let started = false;
+    verb.textContent = 'count in';
+    activeMetronome = new Metronome({ bpm: metroConf.bpm, beatsPerBar, sound: metroConf.sound !== false });
+    activeMetronome.start((beat) => {
+      paintBeat(beat);
+      if (started) return;
+      if (beat.index >= beatsPerBar) {
+        started = true;
+        session.start();
+        return;
+      }
+      glyphSlot.textContent = '';
+      glyphSlot.appendChild(h('div', { class: 'glyph', text: String(beatsPerBar - beat.index) }));
+    });
+  } else {
+    session.start();
+  }
 
   /* --- painters ----------------------------------------------------- */
 
@@ -969,15 +1012,23 @@ function runSession(config) {
       return;
     }
 
+    if (prompt.kind === 'run') {
+      paintSequencePrompt(prompt);
+      return;
+    }
+
     if (prompt.style === 'name') {
-      verb.textContent = micMode ? 'play this note' : 'tap this note';
+      verb.textContent = guided ? 'this note' : micMode ? 'play this note' : 'tap this note';
       glyphSlot.appendChild(glyphFor(prompt.name));
       where.firstChild.textContent = `${['1st', '2nd', '3rd', '4th', '5th', '6th'][prompt.note.string - 1]}`;
       where.lastChild.textContent = `string · ${shortName(prompt.note.string, 0)}`;
       sessionBoard.setMarkers([]);
-      hint.textContent = micMode
-        ? `Find ${prompt.name} on the ${prompt.note.string}${ordinalSuffix(prompt.note.string)} string and play it.`
-        : `Tap ${prompt.name} on the ${prompt.note.string}${ordinalSuffix(prompt.note.string)} string.`;
+      const place = `the ${prompt.note.string}${ordinalSuffix(prompt.note.string)} string`;
+      hint.textContent = guided
+        ? `${prompt.name} on ${place}. The clock moves on by itself.`
+        : micMode
+        ? `Find ${prompt.name} on ${place} and play it.`
+        : `Tap ${prompt.name} on ${place}.`;
     } else {
       verb.textContent = micMode ? 'play the marked note' : 'name the marked note';
       glyphSlot.appendChild(h('div', { class: 'glyph', text: '?' }));
@@ -1049,10 +1100,24 @@ function runSession(config) {
     hint.textContent = 'Anywhere in the shape counts.';
   }
 
+  /** A slot of notes drawn from the pool: play them in order, in one clock. */
+  function paintSequencePrompt(prompt) {
+    const count = prompt.steps.length;
+    verb.textContent = guided ? 'play along' : micMode ? 'play these in order' : 'tap these in order';
+    where.firstChild.textContent = `${count} notes`;
+    where.lastChild.textContent = guided ? 'one after another' : 'in one slot';
+    paintRunBoard(prompt);
+    hint.textContent = guided
+      ? 'Each note gets its share of the slot. Nothing is being judged.'
+      : `Play all ${count} in order before the clock runs out. A wrong note waits for you.`;
+  }
+
   function paintRunBoard(prompt) {
     const markers = [];
     prompt.steps.forEach((step, i) => {
-      if (i < prompt.stepIndex) markers.push({ ...step, kind: 'correct' });
+      // A guided run marks what has gone by rather than what was got right —
+      // nothing here was judged.
+      if (i < prompt.stepIndex) markers.push({ ...step, kind: guided ? 'hint' : 'correct' });
       else if (i === prompt.stepIndex) markers.push({ ...step, kind: 'target', pulse: true, label: step.degree });
       else markers.push({ string: step.string, fret: step.fret, kind: 'ghost' });
     });
@@ -1067,10 +1132,34 @@ function runSession(config) {
     counter.firstChild.textContent = String(prompt.number);
     runProgress.textContent = `note ${Math.min(prompt.stepIndex + 1, prompt.steps.length)} of ${prompt.steps.length}`;
     runProgress.hidden = false;
+    // A scale run already has its whole shape on the board; a drill sequence
+    // needs the order spelled out.
+    if (!isScale) paintSeqStrip(prompt);
+  }
+
+  function paintSeqStrip(prompt) {
+    seqStrip.textContent = '';
+    seqStrip.hidden = false;
+    prompt.steps.forEach((step, i) => {
+      const state = i < prompt.stepIndex ? 'is-done' : i === prompt.stepIndex ? 'is-now' : '';
+      seqStrip.appendChild(h('i', { class: state, text: noteName(step.midi, s.spelling).split('/')[0] }));
+    });
+  }
+
+  function paintBeat(beat) {
+    for (let i = 0; i < beatDots.length; i++) {
+      beatDots[i].className = i === beat.beatInBar ? (beat.accent ? 'is-on is-accent' : 'is-on') : '';
+    }
   }
 
   function paintJudgement(info, sess) {
     const prompt = sess.prompt;
+
+    if (info.verdict === 'advance') {
+      // Guided: the slot simply ran its course.
+      updatePips(sess);
+      return;
+    }
 
     if (info.verdict === 'step') {
       stage.className = 'stage';
@@ -1096,6 +1185,11 @@ function runSession(config) {
     if (info.verdict === 'repeat') {
       verdict.className = 'verdict';
       verdict.textContent = 'Same note again — pick a different one.';
+      return;
+    }
+
+    if (!isScale && prompt.kind === 'run') {
+      paintSequenceJudgement(info, sess);
       return;
     }
 
@@ -1183,9 +1277,46 @@ function runSession(config) {
     updatePips(sess);
   }
 
+  /** The end of a drill sequence: the whole slot, not one note. */
+  function paintSequenceJudgement(info, sess) {
+    const prompt = sess.prompt;
+    if (info.verdict === 'correct') {
+      stage.className = 'stage is-correct';
+      const g = glyphSlot.firstChild;
+      if (g) g.classList.add('is-correct');
+      sessionBoard.setMarkers(prompt.steps.map((st) => ({ ...st, kind: 'correct' })));
+      for (const chip of seqStrip.children) chip.className = 'is-done';
+      verdict.className = 'verdict is-correct';
+      const secs = (info.ms / 1000).toFixed(1);
+      verdict.textContent = info.firstTry
+        ? `Clean — all ${prompt.steps.length} in ${secs}s`
+        : `Done in ${secs}s, with ${sess.wrongThisPrompt.length} slip${sess.wrongThisPrompt.length === 1 ? '' : 's'}`;
+    } else if (info.verdict === 'wrong') {
+      stage.className = 'stage is-wrong';
+      verdict.className = 'verdict is-wrong';
+      verdict.textContent = `That was ${info.playedName} — the slot wants ${noteName(info.expected.midi, s.spelling)}.`;
+      setTimeout(() => {
+        if (sess.state === 'awaiting') stage.className = 'stage';
+      }, 420);
+    } else if (info.verdict === 'timeout') {
+      stage.className = 'stage is-revealed';
+      verdict.className = 'verdict is-wrong';
+      verdict.textContent = `Time — you got ${prompt.stepIndex} of ${prompt.steps.length} notes.`;
+      sessionBoard.setMarkers(
+        prompt.steps.map((st, i) => ({ ...st, kind: i < prompt.stepIndex ? 'correct' : 'wrong', label: shortName(st.string, st.fret) }))
+      );
+    }
+    updatePips(sess);
+  }
+
   function updatePips(sess) {
     const kids = pips.children;
     for (let i = 0; i < kids.length; i++) {
+      if (guided) {
+        // Nothing was judged, so a pip only says whether that slot has been.
+        kids[i].className = i < sess.slotsShown ? 'is-past' : i === sess.slotsShown ? 'is-now' : '';
+        continue;
+      }
       const r = sess.results[i];
       kids[i].className = r ? (r.correct ? 'is-ok' : 'is-bad') : i === sess.results.length ? 'is-now' : '';
     }
@@ -1227,6 +1358,8 @@ function confirmQuit() {
 function cleanupSession() {
   if (activeSession) activeSession.stop();
   activeSession = null;
+  if (activeMetronome) activeMetronome.stop();
+  activeMetronome = null;
   // Undo any per-exercise detection tweak.
   engine.setSensitivity(store.settings().detectionSensitivity);
   if (meterUnsub) meterUnsub();
@@ -1238,6 +1371,7 @@ function cleanupSession() {
 function renderResults(summary, config) {
   const root = $('#screen-results');
   root.textContent = '';
+  if (summary.guided) return renderGuidedResults(root, summary, config);
   const s = store.settings();
   const passed = summary.requiredAccuracy == null || summary.accuracy >= summary.requiredAccuracy;
 
@@ -1321,6 +1455,43 @@ function renderResults(summary, config) {
           else { renderPath(); showScreen('path'); }
         },
       }, [config.scaleLessonId ? 'Back to scales' : 'Back to path']),
+    ])
+  );
+}
+
+/** A guided run has no score to show, so it reports what it put in front of you. */
+function renderGuidedResults(root, summary, config) {
+  const minutes = summary.durationMs / 60000;
+  root.append(
+    h('div', {}, [h('div', { class: 'eyebrow', text: summary.title }), h('h1', { text: 'Run complete' })]),
+    h('div', { class: 'result-grid' }, [
+      h('div', { class: 'tile is-accent' }, [
+        h('span', { text: 'Notes shown' }),
+        h('b', { text: String(summary.notesShown) }),
+        h('small', { text: `${summary.slots} slot${summary.slots === 1 ? '' : 's'} of ${summary.sequenceLength}` }),
+      ]),
+      h('div', { class: 'tile' }, [
+        h('span', { text: 'Time played' }),
+        h('b', { text: minutes >= 1 ? `${minutes.toFixed(1)}m` : `${Math.round(summary.durationMs / 1000)}s` }),
+        h('small', { text: `${summary.secondsPerSlot}s per slot` }),
+      ]),
+      h('div', { class: 'tile' }, [
+        h('span', { text: 'Tempo' }),
+        h('b', { text: summary.bpm ? `${summary.bpm}` : '—' }),
+        h('small', { text: summary.bpm ? 'bpm' : 'no metronome' }),
+      ]),
+    ]),
+    h('div', { class: 'banner' }, [
+      h('b', { text: 'Nothing was scored' }),
+      'A guided run listens to nothing, so it earns no XP and moves no note up or down its schedule. Turn the toggle off when you want it to count.',
+    ]),
+    h('div', { class: 'btn-row', style: 'margin-top:24px' }, [
+      h('button', { class: 'btn is-primary', onclick: () => beginSession({ ...config }) }, ['Run it again']),
+      h('button', {
+        class: 'btn',
+        onclick: () => beginSession({ ...config, guided: false, inputMode: store.settings().inputMode }),
+      }, ['Same drill, for real']),
+      h('button', { class: 'btn is-ghost', onclick: () => { renderDrill(); showScreen('drill'); } }, ['Back to drills']),
     ])
   );
 }
@@ -1521,7 +1692,54 @@ export function renderDrill() {
   const maxFret = h('input', { type: 'number', min: '0', max: String(MAX_FRET), value: '12', style: 'max-width:100px' });
   const naturalsOnly = h('input', { type: 'checkbox', checked: true });
   const promptCount = h('input', { type: 'number', min: '5', max: '60', value: '20', style: 'max-width:100px' });
-  const customClock = clockSlider(s.timerSeconds);
+  const customClock = clockSlider(s.timerSeconds, 'Time per slot');
+
+  /* --- pacing: how many notes a slot holds, and what moves it along --- */
+  const sequence = sequenceSlider(1, () => syncPacing());
+  const guidedOn = h('input', { type: 'checkbox', onchange: () => syncPacing() });
+  const metroOn = h('input', { type: 'checkbox', onchange: () => syncPacing() });
+  const bpm = h('input', {
+    type: 'number',
+    min: String(MIN_BPM),
+    max: String(MAX_BPM),
+    value: '80',
+    style: 'max-width:100px',
+    oninput: () => syncPacing(),
+  });
+  const beatsPerNote = select([['1', 'one beat'], ['2', 'two beats'], ['4', 'four beats']], '1', () => syncPacing());
+  const beatsPerBar = select([['4', 'every 4'], ['3', 'every 3'], ['2', 'every 2'], ['6', 'every 6']], '4', () => syncPacing());
+  const metroRows = h('div', { hidden: true }, [
+    h('div', { class: 'field' }, [h('label', { text: 'Tempo (bpm)' }), bpm]),
+    h('div', { class: 'field' }, [h('label', { text: 'Each note gets' }), beatsPerNote]),
+    h('div', { class: 'field' }, [h('label', { text: 'Accent the click' }), beatsPerBar]),
+  ]);
+  const paceNote = h('div', { class: 'help' });
+
+  /** Seconds a slot lasts, from whichever control is currently in charge. */
+  function slotSeconds() {
+    if (!metroOn.checked) return customClock.seconds();
+    const tempo = clamp(Number(bpm.value) || 80, MIN_BPM, MAX_BPM);
+    const beats = Number(beatsPerNote.value) || 1;
+    return Math.round(((60 / tempo) * beats * sequence.length() * 100)) / 100;
+  }
+
+  function syncPacing() {
+    metroRows.hidden = !metroOn.checked;
+    customClock.field.hidden = metroOn.checked;
+    const notes = sequence.length();
+    const seconds = slotSeconds();
+    const per = notes > 1 ? ` · ${(seconds / notes).toFixed(2)}s a note` : '';
+    if (metroOn.checked) {
+      paceNote.textContent = `${notes} note${notes > 1 ? 's' : ''} a slot at ${clamp(Number(bpm.value) || 80, MIN_BPM, MAX_BPM)} bpm — ${seconds.toFixed(2)}s per slot${per}. The click sits above the range the detector listens in, so it cannot answer for you.`;
+    } else if (!seconds) {
+      paceNote.textContent = guidedOn.checked
+        ? 'A guided run has nothing but the clock to move it along, so it needs one — raise the slider or switch the metronome on.'
+        : 'No clock: each slot waits for you.';
+    } else {
+      paceNote.textContent = `${notes} note${notes > 1 ? 's' : ''} in ${seconds}s${per}.`;
+    }
+  }
+  syncPacing();
 
   root.appendChild(scaleDrillPanel());
 
@@ -1536,14 +1754,33 @@ export function renderDrill() {
             h('label', { text: 'Fret range' }),
             h('div', { style: 'display:flex;gap:10px;align-items:center' }, [minFret, h('span', { text: 'to' }), maxFret]),
           ]),
-        ]),
-        h('div', {}, [
           h('div', { class: 'field' }, [
             h('label', { text: 'Note set' }),
             h('label', { class: 'switch' }, [naturalsOnly, 'Natural notes only (no sharps or flats)']),
           ]),
-          h('div', { class: 'field' }, [h('label', { text: 'Prompts' }), promptCount]),
+          h('div', { class: 'field' }, [
+            h('label', { text: 'Slots' }),
+            promptCount,
+            h('div', { class: 'help', text: 'How many times it asks. One slot holds the whole sequence.' }),
+          ]),
+        ]),
+        h('div', {}, [
+          sequence.field,
+          h('div', { class: 'field' }, [
+            h('label', { text: 'Metronome' }),
+            h('label', { class: 'switch' }, [metroOn, 'Click the beat, and pace the slots by it']),
+          ]),
+          metroRows,
           customClock.field,
+          h('div', { class: 'field' }, [
+            h('label', { text: 'Guided run' }),
+            h('label', { class: 'switch' }, [guidedOn, 'Just show me notes — no microphone, no score']),
+            h('div', {
+              class: 'help',
+              text: 'The notes go by on the clock and nothing is judged, counted or scheduled. Good for warming up, or for playing along to a tempo.',
+            }),
+          ]),
+          h('div', { class: 'field' }, [paceNote]),
         ]),
       ]),
       h('div', { class: 'btn-row' }, [
@@ -1566,13 +1803,39 @@ export function renderDrill() {
                 toast('That leaves fewer than two notes — widen the range.', 'bad');
                 return;
               }
+              const notes = sequence.length();
+              const seconds = slotSeconds();
+              const guided = guidedOn.checked;
+              if (guided && !seconds) {
+                toast('A guided run needs a clock — nothing else would move it along.', 'bad');
+                return;
+              }
+              const metronome = metroOn.checked
+                ? {
+                    bpm: clamp(Number(bpm.value) || 80, MIN_BPM, MAX_BPM),
+                    beatsPerNote: Number(beatsPerNote.value) || 1,
+                    beatsPerBar: Number(beatsPerBar.value) || 4,
+                    sound: true,
+                  }
+                : null;
+              const parts = [`${strings.length} string${strings.length > 1 ? 's' : ''}, frets ${lo}–${hi}`];
+              if (notes > 1) parts.push(`runs of ${notes}`);
+              if (metronome) parts.push(`${metronome.bpm} bpm`);
+              if (guided) parts.push('guided');
               beginSession({
                 pool,
                 prompts: clamp(Number(promptCount.value) || 20, 5, 60),
-                title: `Drill · ${strings.length} string${strings.length > 1 ? 's' : ''}, frets ${lo}–${hi}`,
-                timerSeconds: customClock.seconds(),
+                title: `Drill · ${parts.join(' · ')}`,
+                timerSeconds: seconds,
                 inputMode: s.inputMode,
-                promptStyle: s.promptStyle,
+                // A guided run shows the name and never asks you to name a
+                // marked fret, which there would be no way to answer.
+                promptStyle: guided ? 'name' : s.promptStyle,
+                sequenceLength: notes,
+                guided,
+                metronome,
+                // The click is its own count-in; two at once is a mess.
+                countIn: metronome ? false : undefined,
               });
             },
           },
@@ -1603,6 +1866,35 @@ function clockSlider(initialSeconds, label = 'Time per note') {
     h('div', { class: 'help', text: 'Slide to zero to practise with no clock at all.' }),
   ]);
   return { field, seconds: () => Number(input.value) };
+}
+
+/** How many notes one slot asks for. 1 is the ordinary one-note-at-a-time drill. */
+function sequenceSlider(initial = 1, onInput) {
+  const value = h('b', { text: describeSequence(initial), style: 'font-family:var(--font-mono)' });
+  const input = h('input', {
+    type: 'range',
+    min: '1',
+    max: String(MAX_SEQUENCE),
+    step: '1',
+    value: String(initial),
+    oninput: () => {
+      value.textContent = describeSequence(Number(input.value));
+      if (onInput) onInput(Number(input.value));
+    },
+  });
+  const field = h('div', { class: 'field' }, [
+    h('label', {}, ['Notes per slot · ', value]),
+    input,
+    h('div', {
+      class: 'help',
+      text: 'Above one, each slot is a short run: A, then E, then G, played in that order inside the one clock.',
+    }),
+  ]);
+  return { field, length: () => Number(input.value) };
+}
+
+function describeSequence(n) {
+  return n === 1 ? 'one at a time' : `${n} in a row`;
 }
 
 /** Free scale practice — any shape, any key, no effect on the scales path. */
